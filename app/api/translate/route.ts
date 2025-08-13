@@ -1,4 +1,4 @@
-// src/app/api/translate/route.ts
+// /app/api/translate/route.ts
 export const runtime = "edge";
 
 // GET: 動作確認用
@@ -11,7 +11,9 @@ export async function POST(req: Request) {
   try {
     const bodyText = await req.text(); // JSONでなくても受け取れるようにまずは text()
     return Response.json({ ok: true, received: bodyText || null });
-  } catch (e: any) {
-    return Response.json({ ok: false, error: e?.message || "unknown" }, { status: 500 });
+  } catch (e: unknown) {
+    const message =
+      e instanceof Error ? e.message : typeof e === "string" ? e : "unknown";
+    return Response.json({ ok: false, error: message }, { status: 500 });
   }
 }
