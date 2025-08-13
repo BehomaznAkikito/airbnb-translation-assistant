@@ -148,12 +148,13 @@ export default function Home() {
         />
 
         <button
-          onClick={fromJapanese}
+          type="button" // ← これを追加
+          onClick={toJapanese}
           disabled={busy}
-          className="px-4 py-2 rounded-xl border shadow"
-        >
-          ゲストの言語に翻訳
+          className="px-4 py-2 rounded-xl border shadow">
+          日本語に翻訳
         </button>
+
 
         <textarea
           className="w-full min-h-[120px] rounded-2xl border p-4"
