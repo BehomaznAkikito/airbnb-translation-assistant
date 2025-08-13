@@ -1,18 +1,16 @@
+// src/app/api/translate/route.ts
 import OpenAI from "openai";
 
-export const runtime = "edge"; // 速い・安い（NodeでもOK）
-
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+export const runtime = "edge";
+// ※ ここで new OpenAI(...) しないのがポイント
 
 function toneRule(tone: string, locale: string) {
-  // 言語ごとの「親密度のさじ加減」を軽く調整
   const base =
     tone === "formal"
       ? "丁寧でビジネスライク、曖昧さを避け、敬称・敬語を適切に用いる。絵文字・スラングは使わない。"
       : tone === "casual"
       ? "簡潔でフレンドリー。口語表現を適度に使い、長文を避ける。過度な絵文字・俗語は控えめ。"
       : "中立で失礼のない標準的な文体。";
-  // 英語の地域ニュアンスの軽い誘導
   const enRegion =
     locale === "en-US-west"
       ? "アメリカ西海岸の自然な言い回しを選ぶ（気取らずフレンドリー）。"
@@ -23,7 +21,6 @@ function toneRule(tone: string, locale: string) {
 }
 
 function localeHint(locale: string) {
-  // OpenAIに方言/表記を明示
   switch (locale) {
     case "zh-Hant":
       return "繁體中文（台湾/香港で自然）で書く。";
@@ -44,16 +41,18 @@ export async function POST(req: Request) {
   const { mode, text, tone = "neutral", targetLocale, sourceLocale } =
     await req.json();
 
-  if (!process.env.OPENAI_API_KEY) {
+  // ここで初めて環境変数を読み、クライアントを生成
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
     return new Response(JSON.stringify({ error: "Missing OPENAI_API_KEY" }), {
       status: 500,
     });
   }
+  const client = new OpenAI({ apiKey });
 
   if (mode === "to_ja") {
-    // ゲスト原文 → 日本語
     const res = await client.responses.create({
-      model: "gpt-5", // ここは利用プランに合わせて。gpt-4oでもOK
+      model: "gpt-4o", // 使えるモデル名に合わせてOK
       input: [
         {
           role: "system",
@@ -66,18 +65,15 @@ export async function POST(req: Request) {
         },
       ],
     });
-
-    const out = res.output_text || "";
-    return Response.json({ text: out });
+    return Response.json({ text: res.output_text || "" });
   }
 
   if (mode === "from_ja") {
-    // 日本語 → 指定言語（トーン付き）
     const toneGuide = toneRule(tone, targetLocale);
     const localeGuide = localeHint(targetLocale);
 
     const res = await client.responses.create({
-      model: "gpt-5", // ここもプランに応じて変更可
+      model: "gpt-4o",
       input: [
         {
           role: "system",
@@ -99,9 +95,7 @@ export async function POST(req: Request) {
         },
       ],
     });
-
-    const out = res.output_text || "";
-    return Response.json({ text: out });
+    return Response.json({ text: res.output_text || "" });
   }
 
   return Response.json({ error: "invalid mode" }, { status: 400 });
