@@ -1,4 +1,3 @@
-// app/api/translate/route.ts
 import OpenAI from "openai";
 export const runtime = "edge";
 
@@ -10,12 +9,23 @@ type ReqBody = {
   mode: "to_ja" | "from_ja";
   text: string;
   tone?: "neutral" | "formal" | "casual";
-  targetLocale?: string; // 例: "US English", "Australian English", "German" など
+  targetLocale?: string;
+};
+
+// OpenAI Responses API の返却を最低限で受けるための型
+type ResponsesMinimal = {
+  output_text?: string;
+  output?: Array<{
+    content?: Array<{
+      text?: { value?: string };
+    }>;
+  }>;
 };
 
 export async function POST(req: Request) {
   try {
-    const { mode, text, tone = "neutral", targetLocale } = (await req.json()) as ReqBody;
+    const { mode, text, tone = "neutral", targetLocale } =
+      (await req.json()) as ReqBody;
 
     if (!process.env.OPENAI_API_KEY) {
       return Response.json({ error: "OPENAI_API_KEY is missing" }, { status: 500 });
@@ -24,7 +34,6 @@ export async function POST(req: Request) {
       return Response.json({ error: "text is required" }, { status: 400 });
     }
 
-    // プロンプト（Airbnb用に丁寧・簡潔）
     const system =
       mode === "to_ja"
         ? "You are a professional translator. Translate the user's message into natural, polite, concise Japanese suitable for an Airbnb host."
@@ -36,14 +45,15 @@ export async function POST(req: Request) {
       model: "gpt-4o-mini",
       input: [
         { role: "system", content: system },
-        { role: "user", content: text }
+        { role: "user", content: text },
       ],
     });
 
-    // 念のため安全に取り出す
+    // ← ここがポイント：unknown → 最小型にキャストして any を使わない
+    const data = resp as unknown as ResponsesMinimal;
     const out =
-      (resp as any).output_text?.trim() ||
-      (((resp as any).output?.[0]?.content?.[0] || {}) as any)?.text?.value?.trim() ||
+      data.output_text?.trim() ??
+      data.output?.[0]?.content?.[0]?.text?.value?.trim() ??
       "";
 
     return Response.json({ text: out });
