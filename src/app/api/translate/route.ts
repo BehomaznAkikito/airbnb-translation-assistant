@@ -2,8 +2,13 @@
 import OpenAI from "openai";
 
 export const runtime = "edge";
-// ※ ここで new OpenAI(...) しないのがポイント
 
+// GET（確認用）
+export async function GET() {
+  return Response.json({ ok: true, endpoint: "/api/translate" });
+}
+
+// 文体ルール
 function toneRule(tone: string, locale: string) {
   const base =
     tone === "formal"
@@ -20,6 +25,7 @@ function toneRule(tone: string, locale: string) {
   return `${base} ${enRegion}`.trim();
 }
 
+// ロケールヒント
 function localeHint(locale: string) {
   switch (locale) {
     case "zh-Hant":
@@ -37,65 +43,60 @@ function localeHint(locale: string) {
   }
 }
 
+// POST（翻訳処理）
 export async function POST(req: Request) {
   const { mode, text, tone = "neutral", targetLocale, sourceLocale } =
     await req.json();
 
-  // ここで初めて環境変数を読み、クライアントを生成
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return new Response(JSON.stringify({ error: "Missing OPENAI_API_KEY" }), {
       status: 500,
     });
   }
-  const client = new OpenAI({ apiKey });
+
+  const openai = new OpenAI({ apiKey });
 
   if (mode === "to_ja") {
-    const res = await client.responses.create({
-      model: "gpt-4o", // 使えるモデル名に合わせてOK
+    const res = await openai.responses.create({
+      model: "gpt-4o-mini",
       input: [
         {
           role: "system",
           content:
-            "あなたは多言語のホテル/民泊フロント係。原文の敬意を保ちつつ、自然な日本語に翻訳してください。固有名詞や日時・部屋番号は正確に。",
+            "あなたは多言語のホテル/民泊フロント係。原文の敬意を保ちつつ、自然な日本語に翻訳してください。",
         },
-        {
-          role: "user",
-          content: `原文:\n${text}\n\n出力: 日本語のみ。余計な説明は書かない。`,
-        },
+        { role: "user", content: `原文:\n${text}\n\n出力: 日本語のみ。` },
       ],
     });
-    return Response.json({ text: res.output_text || "" });
+    return Response.json({ text: res.output_text ?? "" });
   }
 
   if (mode === "from_ja") {
     const toneGuide = toneRule(tone, targetLocale);
     const localeGuide = localeHint(targetLocale);
-
-    const res = await client.responses.create({
-      model: "gpt-4o",
+    const res = await openai.responses.create({
+      model: "gpt-4o-mini",
       input: [
         {
           role: "system",
           content:
-            "あなたは民泊ホストの多言語コンシェルジュ。ゲストに失礼のない自然な翻訳を行い、意味の補完や意図の追加はしない。",
+            "あなたは民泊ホストの多言語コンシェルジュ。意味を変えずに自然な翻訳を返します。",
         },
         {
           role: "user",
           content: [
-            `次の日本語メッセージを、指定の言語・文体で翻訳してください。`,
             `文体ガイド: ${toneGuide}`,
             `言語/地域ガイド: ${localeGuide}`,
             sourceLocale ? `参考: ゲスト原文の言語は ${sourceLocale}` : "",
             `日本語原文:\n${text}`,
-            `出力: 指定言語の本文のみ。`,
           ]
             .filter(Boolean)
             .join("\n"),
         },
       ],
     });
-    return Response.json({ text: res.output_text || "" });
+    return Response.json({ text: res.output_text ?? "" });
   }
 
   return Response.json({ error: "invalid mode" }, { status: 400 });
