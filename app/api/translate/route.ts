@@ -1,65 +1,55 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import OpenAI from "openai";
+// app/api/translate/route.ts
 export const runtime = "edge";
 
-export async function GET() {
-  return Response.json({ ok: true, endpoint: "/api/translate" });
-}
+import OpenAI from "openai";
 
-type ReqBody = {
-  mode: "to_ja" | "from_ja";
-  text: string;
-  tone?: "neutral" | "formal" | "casual";
-  targetLocale?: string;
-};
+// 固定で使うモデル（日付付き）
+const MODEL = "gpt-5-mini-2025-08-07";
 
-// OpenAI Responses API の返却を最低限で受けるための型
+// 最小限のレスポンス型（any なし）
 type ResponsesMinimal = {
   output_text?: string;
-  output?: Array<{
-    content?: Array<{
-      text?: { value?: string };
-    }>;
-  }>;
+  content?: Array<{ text?: string }>;
 };
 
 export async function POST(req: Request) {
-  try {
-    const { mode, text, tone = "neutral", targetLocale } =
-      (await req.json()) as ReqBody;
-
-    if (!process.env.OPENAI_API_KEY) {
-      return Response.json({ error: "OPENAI_API_KEY is missing" }, { status: 500 });
-    }
-    if (!text?.trim()) {
-      return Response.json({ error: "text is required" }, { status: 400 });
-    }
-
-    const system =
-      mode === "to_ja"
-        ? "You are a professional translator. Translate the user's message into natural, polite, concise Japanese suitable for an Airbnb host."
-        : `You are a professional translator. Translate the user's message into ${targetLocale || "English"} in a ${tone} tone, suitable for Airbnb host–guest communication. Keep it polite and concise.`;
-
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-    const resp = await client.responses.create({
-      model: "gpt-4o-mini",
-      input: [
-        { role: "system", content: system },
-        { role: "user", content: text },
-      ],
+  // 診断: OpenAI 呼び出し前に現在の環境を返す
+  if (req.headers.get("x-diag") === "1") {
+    return Response.json({
+      modelUsed: MODEL,
+      projectUsed: process.env.OPENAI_PROJECT ?? null,
+      vercelEnv:  process.env.VERCEL_ENV ?? null,
+      vercelUrl:  process.env.VERCEL_URL ?? null,
+      commit:     process.env.VERCEL_GIT_COMMIT_SHA ?? null,
     });
-
-    // ← ここがポイント：unknown → 最小型にキャストして any を使わない
-    const data = resp as unknown as ResponsesMinimal;
-    const out =
-      data.output_text?.trim() ??
-      data.output?.[0]?.content?.[0]?.text?.value?.trim() ??
-      "";
-
-    return Response.json({ text: out });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return Response.json({ error: msg }, { status: 500 });
   }
-}
+
+  const { mode, text } = await req.json();
+
+  const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY!,
+    project: process.env.OPENAI_PROJECT, // 明示
+  });
+
+  const system =
+    mode === "to_ja"
+      ? "You are a translator. Translate the user's English into natural Japanese."
+      : "You are a translator. Translate the user's Japanese into natural English.";
+
+  const r = await openai.responses.create({
+    model: MODEL, // 絶対に日付付き
+    input: [
+      { role: "system", content: system },
+      { role: "user", content: text },
+    ],
+  });
+
+  // 最小型にキャスト
+  const rr = r as unknown as ResponsesMinimal;
+
+  // テキストを取り出す
+  const result = rr.output_text ?? rr.content?.[0]?.text ?? "";
+
+  // 応答
+  return Response.json({ ok: true, result, model: MODEL });
+} // ← これが抜けていた
