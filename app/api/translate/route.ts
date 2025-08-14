@@ -10,7 +10,7 @@ type ResponsesMinimal = {
   content?: Array<{ text?: string }>;
 };
 
-// ← GET は“1つだけ”
+// GET は 1 つだけ
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   if (searchParams.get("diag") === "1") {
@@ -24,7 +24,12 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
-    const { mode, text } = await req.json();
+    const { mode, text } = (await req.json()) as {
+      mode: "to_ja" | "from_ja";
+      text: string;
+      tone?: string;
+      targetLocale?: string;
+    };
 
     const openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
@@ -36,21 +41,29 @@ export async function POST(req: Request) {
         ? "You are a translator. Translate the user's English into natural Japanese."
         : "You are a translator. Translate the user's Japanese into natural English.";
 
-    const r = (await openai.responses.create({
+    const raw = await openai.responses.create({
       model: MODEL,
       input: [
         { role: "system", content: system },
         { role: "user", content: text },
       ],
-    })) as unknown as ResponsesMinimal;
+    });
 
+    // any を使わず “最小型” にキャスト
+    const r = raw as unknown as ResponsesMinimal;
+
+    // any を使わずに取り出す
     const result = r.output_text ?? r.content?.[0]?.text ?? "";
 
     return Response.json({ ok: true, result, model: MODEL });
-  } catch (e: any) {
-    return new Response(
-      JSON.stringify({ ok: false, error: e?.message ?? "unknown" }),
-      { status: 500, headers: { "content-type": "application/json" } }
-    );
+  } catch (e: unknown) {
+    const msg =
+      typeof e === "object" && e && "message" in e
+        ? String((e as { message: unknown }).message)
+        : "unknown";
+    return new Response(JSON.stringify({ ok: false, error: msg }), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
   }
 }
