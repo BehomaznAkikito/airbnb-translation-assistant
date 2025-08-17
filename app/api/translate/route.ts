@@ -1,6 +1,25 @@
 // /app/api/translate/route.ts
 import OpenAI from "openai";
 
+// 言語検出が失敗したとき用の簡易フォールバック
+function guessLangFromText(s: string): "ja" | "ko" | "zh-Hant" | "zh-Hans" | "en" | "und" {
+  // かな（ひらがな/カタカナ/長音）
+  if (/[ぁ-ゖァ-ヺー]/u.test(s)) return "ja";
+  // ハングル
+  if (/[가-힣]/u.test(s)) return "ko";
+  // CJK（中/日/韓の漢字領域）
+  if (/[\u4E00-\u9FFF]/u.test(s)) {
+    // よく出る繁体字が含まれているかで繁体/簡体をざっくり判定
+    const tradHint = /[體國臺門與優來麼說話發點這們嗎員車長灣歡愛學習廣龍雞貓邊醫處後戶]/u.test(s);
+    return tradHint ? "zh-Hant" : "zh-Hans";
+  }
+  // ラテン文字は英語扱い
+  if (/[A-Za-z]/.test(s)) return "en";
+  return "und";
+}
+
+
+
 // Node.js 実行（envやCookie操作を安定させる）
 export const runtime = "nodejs";
 
@@ -87,8 +106,14 @@ const isLangTag = (v: string) =>
   /^zh-(?:Hant|Hans)$/i.test(v);
 
 // 妥当なら採用、ダメなら und（未定義）
-const detected = isLangTag(detectedRaw) ? detectedRaw : "und";
+let detected: string = isLangTag(detectedRaw) ? detectedRaw : "und";
 
+// --- 検出失敗のフォールバック ---
+if (detected === "und") {
+  detected = guessLangFromText(text);   // ← リクエスト本文の原文 `text` を使う
+}
+// "zh" 単体は簡体に正規化（安定化）
+if (detected.toLowerCase() === "zh") detected = "zh-Hans";
 
 
     // 2) 役割（phase）を推定
@@ -102,7 +127,18 @@ const detected = isLangTag(detectedRaw) ? detectedRaw : "und";
       : "neutral";
 
     // 3) 翻訳先の決定
-    let target: string;
+   let target: string =
+    (typeof body?.guestLang === "string" && body.guestLang) ||
+    cookieLang ||
+    "";
+   // --- ターゲットの埋め合わせ ---
+    if (!target || target === "und") {
+      target = detected; // 検出結果で補完
+    }
+    if ((target || "").toLowerCase() === "zh") {
+      target = "zh-Hans"; // "zh" 単体は簡体へ
+    }
+
     let phase: "guest_to_ja" | "host_to_guest";
 
     if (role === "guest") {
