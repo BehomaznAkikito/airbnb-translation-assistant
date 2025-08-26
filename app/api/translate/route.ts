@@ -1,282 +1,323 @@
 // /app/api/translate/route.ts
 import OpenAI from "openai";
 
-// 言語検出が失敗したとき用の簡易フォールバック
-function guessLangFromText(s: string): "ja" | "ko" | "zh-Hant" | "zh-Hans" | "en" | "und" {
-  // かな（ひらがな/カタカナ/長音）
-  if (/[ぁ-ゖァ-ヺー]/u.test(s)) return "ja";
-  // ハングル
-  if (/[가-힣]/u.test(s)) return "ko";
-  // CJK（中/日/韓の漢字領域）
-  if (/[\u4E00-\u9FFF]/u.test(s)) {
-    // よく出る繁体字が含まれているかで繁体/簡体をざっくり判定
-    const tradHint = /[體國臺門與優來麼說話發點這們嗎員車長灣歡愛學習廣龍雞貓邊醫處後戶]/u.test(s);
-    return tradHint ? "zh-Hant" : "zh-Hans";
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// 環境変数で差し替え可能。未指定なら軽量の 4o-mini
+const MODEL = process.env.OPENAI_TRANSLATE_MODEL ?? "gpt-4o-mini-2024-07-18";
+
+type Tone = "neutral" | "formal" | "casual";
+type Action = "to_ja" | "to_guest";
+type DetectResult =
+  | string
+  | { code?: string; lang?: string; language?: string }
+  | Array<{ code?: string; lang?: string; language?: string }>;
+
+interface TranslateRequest {
+  action: Action;       // "to_ja" | "to_guest"
+  text: string;         // 翻訳したい本文
+  guestSource?: string; // ゲスト原文（to_guest のとき必須：ここからゲスト言語を推定）
+  tone?: Tone;          // to_guest のときのみ適用
+  guestLang?: string;       // ★追加: UIで選んだ言語コード("en"など/"auto"可)
+  overrideLang?: string;    // ★追加: ヒント用("auto"可)
+}
+
+interface OkResponse {
+  ok: true;
+  sourceLang: string;   // 入力本文の推定言語
+  targetLang: string;   // 出力言語
+  translation: string;  // 翻訳結果
+}
+
+interface ErrResponse {
+  ok: false;
+  error: string;
+}
+
+export async function POST(req: Request): Promise<Response> {
+  try {
+    const body = (await req.json()) as TranslateRequest;
+
+    // 入力チェック
+    if (!body?.text || !body?.action) {
+      return Response.json(
+        { ok: false, error: "Missing required fields: 'text' and 'action'." } as ErrResponse,
+        { status: 400 }
+      );
+    }
+
+    const action = body.action;
+
+    // 入力本文のざっくり言語推定（失敗時は 'und'）
+    const sourceLang = guessLangFromText(body.text);
+
+    // ① ゲスト原文 → 日本語
+    if (action === "to_ja") {
+      const translated = await translate({
+        text: body.text,
+        targetLang: "ja",
+        tone: "neutral",
+      });
+
+      return Response.json(
+        {
+          ok: true,
+          sourceLang,
+          targetLang: "ja",
+          translation: translated,
+        } as OkResponse
+      );
+    }
+
+    // ② あなたの返答（日本語） → ゲストの言語
+    const guestRaw = (body.guestSource ?? "").trim();
+    if (!guestRaw) {
+      return Response.json(
+        { ok: false, error: "Missing 'guestSource' for action 'to_guest'." } as ErrResponse,
+        { status: 400 }
+      );
+    }
+
+    // UI選択 > ヒント > 自動判定 の優先順位で targetLang を決定
+    let targetLang: string | undefined;
+
+    // 1) 手動選択を最優先
+    if (body.guestLang && body.guestLang !== "auto") {
+      targetLang = body.guestLang;
+    }
+
+    // 2) 次点で overrideLang
+    if (!targetLang && body.overrideLang && body.overrideLang !== "auto") {
+      targetLang = body.overrideLang;
+    }
+
+    // 3) まだ未決定なら自動判定（まず規則、und ならモデル）
+    if (!targetLang) {
+  let detected: string = guessLangFromText(guestRaw);
+  if (detected === "und") {
+    const det = (await detectLanguageViaModel(guestRaw)) as DetectResult;
+
+    const code: string =
+      typeof det === "string"
+        ? det
+        : Array.isArray(det)
+          ? (det[0]?.code ?? det[0]?.lang ?? det[0]?.language ?? "en")
+          : (det.code ?? det.lang ?? det.language ?? "en");
+
+    detected = code;
   }
-  // ラテン文字は英語扱い
-  if (/[A-Za-z]/.test(s)) return "en";
+  targetLang = detected; // 例: "en"
+}
+
+
+    const tone: Tone = body.tone ?? "neutral";
+
+    const translated = await translate({
+      text: body.text,          // 日本語の返信
+      targetLang: targetLang!,  // 最終決定した言語
+      tone,
+    });
+
+    return Response.json(
+      {
+        ok: true,
+        sourceLang,              // デバッグ用ざっくり推定
+        targetLang: targetLang!, // 実際に使ったターゲット
+        translation: translated,
+      } as OkResponse
+    );
+
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Unknown error in /api/translate";
+    return Response.json({ ok: false, error: message } as ErrResponse, { status: 500 });
+  }
+}
+
+/* ===== 言語判定ユーティリティ ===== */
+
+// 短い「漢字だけ」→ 中国語への誤爆を避けるため 'und' 扱いにする
+const SHORT_KANJI_RE = /^[\u3400-\u9FFF]{1,6}$/;
+function isShortKanjiOnly(s: string): boolean {
+  return SHORT_KANJI_RE.test(s.trim());
+}
+
+/** ざっくり文字種で判定（失敗時 'und'）。中国語は簡体/繁体を分ける */
+function guessLangFromText(s: string):
+  | "ja" | "ko" | "zh-Hant" | "zh-Hans" | "en"
+  | "es" | "fr" | "de" | "it" | "pt" | "ro" | "tr"
+  | "ru" | "uk"
+  | "hi" | "ta" | "te" | "bn" | "kn" | "ml" | "pa"
+  | "th" | "vi" | "id" | "my" | "lo"
+  | "he" | "ar" | "fa" | "ur" | "ps"
+  | "und" {
+  if (!s) return "und";
+  if (isShortKanjiOnly(s)) return "und";
+
+  // ===== 非ラテン系 =====
+  // ヘブライ語 U+0590–05FF
+  if (/[\u0590-\u05FF]/u.test(s)) return "he";
+
+  // 日本語 / 韓国語
+  if (/[ぁ-ゖァ-ヺー]/u.test(s)) return "ja";
+  if (/[가-힣]/u.test(s)) return "ko";
+
+  // 中国語（繁体/簡体の粗判）
+  if (/[體國臺與優來麼說話發點這們嗎員門車長灣歡愛學習廣龍雞貓邊醫]/u.test(s)) return "zh-Hant";
+  if (/[为这们吗级购广龙爱边医门]/u.test(s)) return "zh-Hans";
+
+  // ミャンマー（ビルマ） U+1000–109F + Ext-A/B
+  if (/[\u1000-\u109F\uA9E0-\uA9FF\uAA60-\uAA7F]/u.test(s)) return "my";
+  // ラオス U+0E80–0EFF
+  if (/[\u0E80-\u0EFF]/u.test(s)) return "lo";
+  // タイ U+0E00–0E7F
+  if (/[\u0E00-\u0E7F]/u.test(s)) return "th";
+
+  // インド系ブロック
+  if (/[\u0900-\u097F]/u.test(s)) return "hi"; // デーヴァナーガリー（例: ヒンディー）
+  if (/[\u0B80-\u0BFF]/u.test(s)) return "ta"; // タミル
+  if (/[\u0C00-\u0C7F]/u.test(s)) return "te"; // テルグ
+  if (/[\u0980-\u09FF]/u.test(s)) return "bn"; // ベンガル
+  if (/[\u0C80-\u0CFF]/u.test(s)) return "kn"; // カンナダ
+  if (/[\u0D00-\u0D7F]/u.test(s)) return "ml"; // マラヤーラム
+  if (/[\u0A00-\u0A7F]/u.test(s)) return "pa"; // グルムキー（パンジャーブ語）
+
+  // アラビア文字（base + supplement + ext-A）
+  if (/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/u.test(s)) {
+    // パシュトゥー固有
+    if (/[ځڅښږڼټډړګ]/u.test(s)) return "ps";
+    // ウルドゥー固有
+    if (/[ٹڈڑےٰںھہ]/u.test(s)) return "ur";
+    // ペルシア（Farsi）固有
+    if (/[پچژگ]/u.test(s)) return "fa";
+    // 既定はアラビア語
+    return "ar";
+  }
+
+  // キリル系 — ウクライナ→ロシア→その他
+  if (/[їєіґЇЄІҐ]/u.test(s)) return "uk";
+  if (/[ёэыЁЭЫ]/u.test(s)) return "ru";
+  if (/\p{Script=Cyrillic}/u.test(s)) return "ru";
+
+  // ===== ラテン系（独自文字や頻出語）=====
+  // トルコ語（独自文字）
+  if (/[ğĞşŞıİöÖüÜçÇ]/u.test(s)) return "tr";
+  // ルーマニア語（独自文字）
+  if (/[ăâîșşţțĂÂÎȘŞŢȚ]/u.test(s)) return "ro";
+  // イタリア語（機能語）
+  if (/\b(che|non|per|con|ciao|grazie|più|sono|sei|siete|degli|delle|dell|alla|alle|allo|agli|gli|una|uno|un|nel|nella|dai|dal|dalla)\b/i.test(s)) {
+    return "it";
+  }
+
+  // ベトナム語ダイアクリティクス
+  if (/[ăâêôơưđĂÂÊÔƠƯĐ]/u.test(s)) return "vi";
+  // インドネシア語の頻出語
+  if (/\b(yang|dan|tidak|saya|anda)\b/i.test(s)) return "id";
+
+  // 西欧（ざっくり）
+  if (/\b(el|la|de|y|¿|¡)\b/i.test(s)) return "es";
+  if (/\b(le|la|de|des|est|avec)\b/i.test(s)) return "fr";
+  if (/\b(der|die|das|und|nicht|ist)\b/i.test(s)) return "de";
+  if (/\b(o|a|de|que|não|está)\b/i.test(s)) return "pt";
+
+  // 英語は「全文がASCIIのときのみ」（Wi-Fi混入で英語落ちするのを回避）
+  if (!/[^\x00-\x7F]/.test(s) && /[A-Za-z]/.test(s)) return "en";
+
   return "und";
 }
 
 
+/** LLMで言語コードを推定（JSON返答を要求） */
+async function detectLanguageViaModel(text: string): Promise<string> {
+  const completion = await client.chat.completions.create({
+    model: MODEL,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a language detector. Reply ONLY with JSON like {\"lang\":\"<code>\"}. " +
+          "Use ISO 639-1 if possible. For Chinese, use 'zh-Hans' or 'zh-Hant'.",
+      },
+      { role: "user", content: `Detect the language code for:\n${text}` },
+    ],
+  });
 
-// Node.js 実行（envやCookie操作を安定させる）
-export const runtime = "nodejs";
-
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-
-// --- 型 ---
-type Tone = "polite" | "neutral" | "casual";
-type Role = "guest" | "host";
-
-type Body = {
-  text: string;
-  role?: Role;          // 省略可：未指定&Cookieなし→guest、Cookieあり→host と推定
-  tone?: Tone;          // デフォルト "neutral"
-  guestLang?: string;   // 任意：host時にCookieが無い場合の明示指定に使える
-};
-
-// --- 小道具 ---
-const isNonEmptyStr = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
-const isISO639ish = (v: string) => /^[a-z]{2}(-[A-Z]{2})?$/.test(v); // 例: "en", "pt-BR"
-const cookieName = "guest_lang";
-const cookieMaxAgeSec = 60 * 30; // 30分
-
-function readCookie(req: Request, name: string): string | null {
-  const raw = req.headers.get("cookie") || "";
-  const m = raw.split(/;\s*/).map((kv) => kv.split("=")).find(([k]) => k === name);
-  return m && m[1] ? decodeURIComponent(m[1]) : null;
-}
-
-function setCookie(res: Response, name: string, value: string, maxAgeSec: number) {
-  const parts = [
-    `${name}=${encodeURIComponent(value)}`,
-    "Path=/",
-    `Max-Age=${maxAgeSec}`,
-    "SameSite=Lax",
-    "Secure",
-  ];
-  res.headers.append("Set-Cookie", parts.join("; "));
-}
-
-// --- メイン ---
-export async function POST(req: Request) {
-  console.log("OPENAI_API_KEY:", process.env.OPENAI_API_KEY?.slice(0, 6) + "*****");
+  const raw = completion.choices[0]?.message?.content ?? "{\"lang\":\"und\"}";
+  const json = extractJson(raw);
+  if (!json) return "und";
   try {
-    if (!process.env.OPENAI_API_KEY) {
-      return Response.json(
-        { ok: false, error: { code: "NO_API_KEY", message: "OPENAI_API_KEY is not set" } },
-        { status: 401 }
-      );
-    }
-
-    const body = (await req.json()) as Partial<Body>;
-    const text = isNonEmptyStr(body.text) ? body.text : "";
-
-    if (!isNonEmptyStr(text)) {
-      return Response.json({ ok: false, error: "Missing 'text'." }, { status: 400 });
-    }
-
-    // 1) 言語検出（安価・高速）
-    const detect = await client.responses.create({
-      model: "gpt-5-nano",
-      input: [
-        {
-          role: "system",
-          // detect の system メッセージをこれに
-content:
-  "Detect the user's language and return ONLY a BCP-47 tag: " +
-  "language (ISO 639-1). Include a Script subtag when relevant (e.g., sr-Cyrl, sr-Latn, zh-Hant, zh-Hans). " +
-  "Include a Region subtag only if obvious (e.g., pt-BR vs pt-PT). No extra text.",
-        },
-        { role: "user", content: text },
-      ],
-    });
-    // 検出結果の生文字列（先に raw を作る）
-const detectedRaw = detect.output_text
-  .trim()
-  .toLowerCase()
-  .slice(0, 20)
-  .replace(/[^a-z-]/g, "");
-
-// BCP-47 っぽいタグ（言語 + 任意で Script または Region）を許可。
-// 例: en / ja / de / hi / te / pt-BR / sr-Cyrl / zh-Hant / zh-Hans
-const isLangTag = (v: string) =>
-  /^(?:[a-z]{2})(?:-(?:[A-Z][a-z]{3}|[A-Z]{2}))?$/i.test(v) ||
-  /^zh-(?:Hant|Hans)$/i.test(v);
-
-// 妥当なら採用、ダメなら und（未定義）
-let detected: string = isLangTag(detectedRaw) ? detectedRaw : "und";
-
-// --- 検出失敗のフォールバック ---
-if (detected === "und") {
-  detected = guessLangFromText(text);   // ← リクエスト本文の原文 `text` を使う
+    const parsed = JSON.parse(json) as { lang?: string };
+    const lang = (parsed.lang ?? "und").trim();
+    return lang || "und";
+  } catch {
+    return "und";
+  }
 }
-// "zh" 単体は簡体に正規化（安定化）
-if (detected.toLowerCase() === "zh") detected = "zh-Hans";
 
+/** 実際の翻訳 */
+async function translate(args: { text: string; targetLang: string; tone: Tone }): Promise<string> {
+  const { text, targetLang, tone } = args;
 
-    // 2) 役割（phase）を推定
-    const cookieLang = readCookie(req, cookieName);
-    const role: Role =
-      body.role ??
-      (cookieLang ? "host" : "guest"); // Cookieがあれば「返信」フェーズとみなす
+  const toneHint =
+    tone === "formal"
+      ? "Use polite, professional hospitality tone."
+      : tone === "casual"
+      ? "Use friendly and light tone (no slang)."
+      : "Use neutral, clear tone.";
 
-    const tone: Tone = (["polite", "neutral", "casual"] as const).includes((body.tone as Tone) ?? "neutral")
-      ? ((body.tone as Tone) ?? "neutral")
-      : "neutral";
+  const completion = await client.chat.completions.create({
+    model: MODEL,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a precise translation engine for Airbnb hosts. " +
+          "Translate the user's message into the requested target language. " +
+          "Preserve meaning, keep URLs/numbers/dates as-is, avoid adding information. " +
+          "Reply ONLY with JSON: {\"translation\":\"...\"}.",
+      },
+      {
+        role: "user",
+        content:
+          `Target language: ${targetLang}\n` +
+          `${toneHint}\n` +
+          "Keep sentences concise and natural for guest communication.\n" +
+          "Text to translate:\n" +
+          text,
+      },
+    ],
+  });
 
-    // 3) 翻訳先の決定
-   let target: string =
-    (typeof body?.guestLang === "string" && body.guestLang) ||
-    cookieLang ||
-    "";
-   // --- ターゲットの埋め合わせ ---
-    if (!target || target === "und") {
-      target = detected; // 検出結果で補完
-    }
-    if ((target || "").toLowerCase() === "zh") {
-      target = "zh-Hans"; // "zh" 単体は簡体へ
-    }
+  const raw = completion.choices[0]?.message?.content ?? "{\"translation\":\"\"}";
+  const json = extractJson(raw);
+  if (json) {
+    const parsed = safeParse<{ translation?: string }>(json);
+    const t = (parsed.translation ?? "").trim();
+    if (t) return t;
+  }
+  // 念のためのフォールバック
+  return raw.trim();
+}
 
-    let phase: "guest_to_ja" | "host_to_guest";
+/* ===== 文字列ユーティリティ ===== */
 
-    if (role === "guest") {
-      // ゲストの言語 → 日本語（保存）
-      target = "ja";
-      phase = "guest_to_ja";
-    } else {
-      // あなたの日本語 → ゲストの言語（Cookie優先 / 指定があれば上書き）
-      const to = isNonEmptyStr(body.guestLang) ? body.guestLang.trim() : (cookieLang ?? "");
-      if (!isISO639ish(to)) {
-        // 保険：CookieもguestLangも無ければ、検出から推定（日本語を送ってくる前提なので非jaを採用/なければ英語）
-        const fallback = detected !== "ja" ? detected : "en";
-        return Response.json(
-          {
-            ok: false,
-            error:
-              `Missing guest language. Provide ` +
-              `Cookie "${cookieName}" or body.guestLang (e.g., "en"). ` +
-              `Fallback guess would be "${fallback}", but explicit context is safer.`,
-          },
-          { status: 400 }
-        );
-      }
-      target = to;
-      phase = "host_to_guest";
-    }
+function extractJson(s: string): string | null {
+  // ```json ... ``` または ``` ... ``` を優先的に抽出
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence && fence[1]) return fence[1].trim();
+  // 先頭から { ... } を強引に取り出す
+  const first = s.indexOf("{");
+  const last = s.lastIndexOf("}");
+  if (first >= 0 && last > first) return s.slice(first, last + 1).trim();
+  return null;
+}
 
-    // 4) トーン指示
-    const toneGuide =
-      tone === "polite"
-        ? "Use a polite/business tone appropriate for Airbnb guest messaging."
-        : tone === "casual"
-        ? "Use a friendly casual tone appropriate for Airbnb guest messaging."
-        : "Use a neutral, clear tone appropriate for Airbnb guest messaging.";
-
-    // 5) 翻訳 or 言い換え
-    //    役割ごとに「出力は必ず target だけ」を強制
-    const systemLines: string[] = [
-      `You are a translation assistant for Airbnb hosts.`,
-      `Your output MUST be entirely in ${target}.`,
-      `Do not include explanations, prefaces, or the source text.`,
-      toneGuide,
-    ];
-
-    // source==target のときは言い換えに切り替え
-    const mustTranslate =
-      (role === "guest" && detected !== "ja") ||
-      (role === "host" && detected !== target) ||
-      // 検出が "und"（不明）なら一応翻訳扱い
-      detected === "und";
-
-    const instruction = mustTranslate
-      ? `Translate the user message into ${target}. Keep all factual details, numbers, dates, amounts, times. Do not add or omit information.`
-      : `Rewrite the user message in ${target} with the requested tone, without changing meaning, numbers, dates, amounts, or times.`;
-
-    const reply = await client.responses.create({
-      model: "gpt-5-mini",
-      input: [
-        { role: "system", content: systemLines.join(" ") },
-        {
-          role: "user",
-          content: [
-            `Detected source language: ${detected}. Target language: ${target}.`,
-            instruction,
-            `Text: """${text}"""`,
-          ].join("\n"),
-        },
-      ],
-    });
-
-    let out = reply.output_text.trim();
-
-    // 6) 日本語ターゲット時の簡易ポストチェック（英語っぽかったらリトライ）
-    if (
-      target === "ja" &&
-      /[A-Za-z]/.test(out) &&
-      (out.replace(/[^\u3040-\u30FF\u4E00-\u9FFF]/g, "").length <
-        out.replace(/[^A-Za-z]/g, "").length)
-    ) {
-      const retry = await client.responses.create({
-        model: "gpt-5-mini",
-        input: [
-          {
-            role: "system",
-            content: "Translate strictly into Japanese only. No English words unless proper nouns or codes. No explanations.",
-          },
-          { role: "user", content: `Text: """${text}"""` },
-        ],
-      });
-      out = retry.output_text.trim();
-    }
-
-    // 7) レスポンス & Cookie設定（guestフェーズの時だけ保存/更新）
-    const payload = {
-      ok: true as const,
-      phase,
-      src: detected,
-      target,
-      tone,
-      text: out,
-    };
-
-    const res = Response.json(payload);
-
-    if (phase === "guest_to_ja" && isISO639ish(detected)) {
-      // 最初のゲスト言語を保存（30分）
-      setCookie(res, cookieName, detected, cookieMaxAgeSec);
-    }
-    return res;
-  } catch (err: unknown) {
-    const status = (() => {
-      if (typeof err === "object" && err && "status" in err) {
-        const s = (err as Record<string, unknown>).status;
-        if (typeof s === "number") return s;
-      }
-      return 500;
-    })();
-
-    const message = (() => {
-      if (err instanceof Error) return err.message;
-      if (typeof err === "object" && err && "error" in err) {
-        const e = (err as Record<string, unknown>).error;
-        if (
-          typeof e === "object" &&
-          e !== null &&
-          "message" in (e as Record<string, unknown>) &&
-          typeof (e as Record<string, unknown>).message === "string"
-        ) {
-          return (e as Record<string, unknown>).message as string;
-        }
-      }
-      try {
-        return JSON.stringify(err);
-      } catch {
-        return String(err);
-      }
-    })();
-
-    return Response.json({ ok: false, error: message }, { status });
+function safeParse<T>(json: string): T {
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    return {} as T;
   }
 }
