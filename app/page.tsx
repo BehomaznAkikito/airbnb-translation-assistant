@@ -6,37 +6,19 @@ import type { ChangeEvent } from "react";
 
 type Tone = "neutral" | "formal" | "casual";
 
-// 右→左言語（表示方向に使う）
-const RTL = new Set(["he", "ar", "fa", "ur", "ps"]);
-
-// 手動指定ドロップダウン
-const LANG_OPTIONS: { code: string; label: string }[] = [
-  { code: "auto", label: "自動判定" },
-  { code: "zh-Hans", label: "中国語（簡体）" },
-  { code: "zh-Hant", label: "中国語（繁体）" },
-  { code: "en", label: "英語" },
-  { code: "he", label: "ヘブライ語" },
-  { code: "ar", label: "アラビア語" },
-  { code: "fa", label: "ペルシア語" },
-  { code: "ur", label: "ウルドゥー語" },
-  { code: "ps", label: "パシュトゥー語" },
-  { code: "ru", label: "ロシア語" },
-  { code: "uk", label: "ウクライナ語" },
-  { code: "tr", label: "トルコ語" },
-  { code: "it", label: "イタリア語" },
-  { code: 'fr', label: "フランス語" },
-  { code: "ro", label: "ルーマニア語" },
-  { code: "ta", label: "タミル語" },
-  { code: "te", label: "テルグ語" },
-  { code: "bn", label: "ベンガル語" },
-  { code: "kn", label: "カンナダ語" },
-  { code: "ml", label: "マラヤーラム語" },
-  { code: "pa", label: "パンジャーブ語" },
-  { code: "th", label: "タイ語" },
-  { code: "vi", label: "ベトナム語" },
-  { code: "id", label: "インドネシア語" },
-  { code: "my", label: "ミャンマー語" },
-  { code: "lo", label: "ラオス語" },
+const LOCALES = [
+  { code: "en-US-west", label: "English — US West Coast" },
+  { code: "en-US-east", label: "English — US East Coast" },
+  { code: "en-AU", label: "English — Australia" },
+  { code: "en-NZ", label: "English — New Zealand" },
+  { code: "de-DE", label: "Deutsch (DE)" },
+  { code: "de-CH", label: "Schweizer Hochdeutsch (CH)" },
+  { code: "fr-FR", label: "Français" },
+  { code: "it-IT", label: "Italiano" },
+  { code: "es-ES", label: "Español" },
+  { code: "zh-Hant", label: "繁體中文" },
+  { code: "zh-Hans", label: "简体中文" },
+  { code: "ko-KR", label: "한국어" },
 ];
 
 // API レスポンス型

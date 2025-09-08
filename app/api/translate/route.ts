@@ -39,69 +39,20 @@ interface ErrResponse {
 
 export async function POST(req: Request): Promise<Response> {
   try {
-    // 受信ボディ（型はまだ確定しない）
-    const bodyUnknown = (await req.json()) as unknown;
+    const body = (await req.json()) as TranslateRequest;
 
-    // 互換シム用の入力型（any禁止）
-    type Incoming = Partial<TranslateRequest> & {
-      mode?: string;    // 例: "to_ja"
-      target?: string;  // 例: "ja"
-      message?: string; // text の別名
-      content?: string; // text の別名
-    };
-    const raw = bodyUnknown as Incoming;
-
-    // --- 互換シム：action / text を正規化 -------------------------
-    // action: { action:"to_ja" } が正だが、{ mode:"to_ja" } / { target:"ja" } も受ける
-    let actionNorm: TranslateRequest["action"] | undefined =
-      raw.action as TranslateRequest["action"] | undefined;
-
-    if (!actionNorm) {
-      if (typeof raw.mode === "string") {
-        actionNorm = raw.mode as TranslateRequest["action"];
-      } else if (
-        typeof raw.target === "string" &&
-        raw.target.toLowerCase().startsWith("ja")
-      ) {
-        actionNorm = "to_ja";
-      }
-    }
-
-    // text: {text} が正だが、{message}/{content} も許容
-    const textNorm =
-      typeof raw.text === "string" && raw.text.length > 0
-        ? raw.text
-        : typeof raw.message === "string" && raw.message.length > 0
-        ? raw.message
-        : typeof raw.content === "string" && raw.content.length > 0
-        ? raw.content
-        : "";
-
-    // 以降は payload をソースオブジェクトに統一
-    const payload: TranslateRequest = {
-      ...(raw as TranslateRequest),
-      action: actionNorm as TranslateRequest["action"],
-      text: textNorm,
-    };
-    // -------------------------------------------------------------
-
-    // 必須チェック
-    if (!payload?.text || !payload?.action) {
+    // 入力チェック
+    if (!body?.text || !body?.action) {
       return Response.json(
         { ok: false, error: "Missing required fields: 'text' and 'action'." } as ErrResponse,
         { status: 400 }
       );
     }
 
-    const action = payload.action;
+    const action = body.action;
 
-// 入力本文のざっくり言語推定
-let sourceLang: string = (await detectLangReliable(payload.text)).code;
-
-// detectLangReliable が und（不明）ならモデルでフォールバック
-if (sourceLang === "und") {
-  sourceLang = await detectLanguageViaModel(payload.text);
-}
+    // 入力本文のざっくり言語推定（失敗時は 'und'）
+    const sourceLang = guessLangFromText(body.text);
 
     // ① ゲスト原文 → 日本語
     if (action === "to_ja") {
@@ -144,13 +95,25 @@ if (sourceLang === "und") {
     }
 
     // 3) まだ未決定なら自動判定（まず規則、und ならモデル）
-    // 3) まだ未決定なら自動判定（高精度版）
-if (!targetLang) {
-  const { code } = await detectLangReliable(guestRaw);
-  targetLang = code; // 例: "fr" / "pl" / "sq"
+    if (!targetLang) {
+  let detected: string = guessLangFromText(guestRaw);
+  if (detected === "und") {
+    const det = (await detectLanguageViaModel(guestRaw)) as DetectResult;
+
+    const code: string =
+      typeof det === "string"
+        ? det
+        : Array.isArray(det)
+          ? (det[0]?.code ?? det[0]?.lang ?? det[0]?.language ?? "en")
+          : (det.code ?? det.lang ?? det.language ?? "en");
+
+    detected = code;
+  }
+  targetLang = detected; // 例: "en"
 }
 
-    const tone: Tone = payload.tone ?? "neutral";
+
+    const tone: Tone = body.tone ?? "neutral";
 
     const translated = await translate({
       text: payload.text,         // 日本語の返信
@@ -173,6 +136,7 @@ if (!targetLang) {
     return Response.json({ ok: false, error: message } as ErrResponse, { status: 500 });
   }
 }
+
 
 /* ===== 言語判定ユーティリティ ===== */
 
