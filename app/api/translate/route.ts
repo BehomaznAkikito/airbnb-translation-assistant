@@ -209,13 +209,28 @@ function guessLangFromText(s: string):
   if (/[\u0E00-\u0E7F]/u.test(s)) return "th";
 
   // インド系ブロック
-  if (/[\u0900-\u097F]/u.test(s)) return "hi"; // デーヴァナーガリー（例: ヒンディー）
-  if (/[\u0B80-\u0BFF]/u.test(s)) return "ta"; // タミル
-  if (/[\u0C00-\u0C7F]/u.test(s)) return "te"; // テルグ
-  if (/[\u0980-\u09FF]/u.test(s)) return "bn"; // ベンガル
-  if (/[\u0C80-\u0CFF]/u.test(s)) return "kn"; // カンナダ
-  if (/[\u0D00-\u0D7F]/u.test(s)) return "ml"; // マラヤーラム
-  if (/[\u0A00-\u0A7F]/u.test(s)) return "pa"; // グルムキー（パンジャーブ語）
+
+  // デーヴァナーガリー（例: ヒンディー）
+  if (/[\u0900-\u097F]/u.test(s)) return "hi";
+
+  // タミル語 (Tamil) U+0B80–0BFF
+  if (/[\u0B80-\u0BFF]/u.test(s)) return "ta";
+
+  // テルグ語 (Telugu) U+0C00–0C7F
+  if (/[\u0C00-\u0C7F]/u.test(s)) return "te";
+
+  // ベンガル語 (Bengali) U+0980–09FF
+  if (/[\u0980-\u09FF]/u.test(s)) return "bn";
+
+  // カンナダ語 (Kannada) U+0C80–0CFF
+  if (/[\u0C80-\u0CFF]/u.test(s)) return "kn";
+
+  // マラヤーラム語 (Malayalam) U+0D00–0D7F
+  if (/[\u0D00-\u0D7F]/u.test(s)) return "ml";
+
+  // パンジャーブ語（グルムキー）(Punjabi/Gurmukhi) U+0A00–0A7F
+  if (/[\u0A00-\u0A7F]/u.test(s)) return "pa";
+
 
   // アラビア文字（base + supplement + ext-A）
   if (/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/u.test(s)) {
