@@ -36,31 +36,56 @@ interface ErrResponse {
   error: string;
 }
 
+
 export async function POST(req: Request): Promise<Response> {
   try {
-    const body = (await req.json()) as TranslateRequest;
+    // 受信ボディ（型はまだ確定しない）
+    const bodyUnknown = (await req.json()) as unknown;
 
-    // ① 互換シム（ここを新規追加）
-    // - フロントが {mode:"to_ja"} を送ってきても受ける
-    // - text の別名（message/content）も吸収
-    const raw: any = body ?? {};
-    if (!raw.action) {
+    // 互換シム用の入力型（any禁止）
+    type Incoming = Partial<TranslateRequest> & {
+      mode?: string;    // 例: "to_ja"
+      target?: string;  // 例: "ja"
+      message?: string; // text の別名
+      content?: string; // text の別名
+    };
+    const raw = bodyUnknown as Incoming;
+
+    // --- 互換シム：action / text を正規化 -------------------------
+    // action: { action:"to_ja" } が正だが、{ mode:"to_ja" } / { target:"ja" } も受ける
+    let actionNorm: TranslateRequest["action"] | undefined =
+      raw.action as TranslateRequest["action"] | undefined;
+
+    if (!actionNorm) {
       if (typeof raw.mode === "string") {
-        raw.action = raw.mode;           // "to_ja" → action
+        actionNorm = raw.mode as TranslateRequest["action"];
       } else if (
         typeof raw.target === "string" &&
         raw.target.toLowerCase().startsWith("ja")
       ) {
-        raw.action = "to_ja";            // target が ja 系なら to_ja と解釈
+        actionNorm = "to_ja";
       }
     }
-    if (!raw.text) {
-      raw.text = raw.message ?? raw.content ?? "";
-    }
-    // 以降この payload を使う
-    const payload = raw as TranslateRequest;
 
-    // ② 必須チェック（payload に対して行う）
+    // text: {text} が正だが、{message}/{content} も許容
+    const textNorm =
+      typeof raw.text === "string" && raw.text.length > 0
+        ? raw.text
+        : typeof raw.message === "string" && raw.message.length > 0
+        ? raw.message
+        : typeof raw.content === "string" && raw.content.length > 0
+        ? raw.content
+        : "";
+
+    // 以降は payload をソースオブジェクトに統一
+    const payload: TranslateRequest = {
+      ...(raw as TranslateRequest),
+      action: actionNorm as TranslateRequest["action"],
+      text: textNorm,
+    };
+    // -------------------------------------------------------------
+
+    // 必須チェック
     if (!payload?.text || !payload?.action) {
       return Response.json(
         { ok: false, error: "Missing required fields: 'text' and 'action'." } as ErrResponse,
@@ -152,7 +177,6 @@ export async function POST(req: Request): Promise<Response> {
     return Response.json({ ok: false, error: message } as ErrResponse, { status: 500 });
   }
 }
-
 
 /* ===== 言語判定ユーティリティ ===== */
 
