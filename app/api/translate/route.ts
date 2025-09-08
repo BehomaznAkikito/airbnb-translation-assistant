@@ -291,7 +291,10 @@ function guessLangFromText(s: string):
 const ALLOWED_LANGS = new Set([
   'ja','en','fr','de','es','pt','it','ro','pl','sq',
   'zh','zh-Hant','ko','ru','uk','tr','nl','sv','no','da','fi',
-  'ar','fa','ur','he','hi','bn','th','vi','id','my','lo'
+  'ar','fa','ur','he',
+  // 南アジア系（ここを追加）
+  'hi','bn','ta','te','kn','ml','pa',
+  'th','vi','id','my','lo'
 ]);
 
 /** 変種を正規化 */
