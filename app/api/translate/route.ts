@@ -96,7 +96,7 @@ export async function POST(req: Request): Promise<Response> {
     const action = payload.action;
 
     // 入力本文のざっくり言語推定（失敗時は 'und'）
-    const sourceLang = guessLangFromText(payload.text);
+    const sourceLang = (await detectLangReliable(payload.text)).code;
 
     // ① ゲスト原文 → 日本語
     if (action === "to_ja") {
@@ -139,20 +139,11 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     // 3) まだ未決定なら自動判定（まず規則、und ならモデル）
-    if (!targetLang) {
-      let detected: string = guessLangFromText(guestRaw);
-      if (detected === "und") {
-        const det = (await detectLanguageViaModel(guestRaw)) as DetectResult;
-        const code: string =
-          typeof det === "string"
-            ? det
-            : Array.isArray(det)
-              ? (det[0]?.code ?? det[0]?.lang ?? det[0]?.language ?? "en")
-              : (det.code ?? det.lang ?? det.language ?? "en");
-        detected = code;
-      }
-      targetLang = detected; // 例: "en"
-    }
+    // 3) まだ未決定なら自動判定（高精度版）
+if (!targetLang) {
+  const { code } = await detectLangReliable(guestRaw);
+  targetLang = code; // 例: "fr" / "pl" / "sq"
+}
 
     const tone: Tone = payload.tone ?? "neutral";
 
@@ -266,8 +257,88 @@ function guessLangFromText(s: string):
 
   // 英語は「全文がASCIIのときのみ」（Wi-Fi混入で英語落ちするのを回避）
   if (!/[^\x00-\x7F]/.test(s) && /[A-Za-z]/.test(s)) return "en";
+  // 英語は「全文がASCIIのときのみ」（Wi-Fi混入で英語落ちするのを回避）
+  if (!/[^\x00-\x7F]/.test(s) && /[A-Za-z]/.test(s)) return "en";
 
+  // 追加: フランス語/スペイン語/ポルトガル語の簡易判定
+  if (/\b(le|la|de|des|est|avec|nous|vous|merci|soir[ée]e|ville)\b/i.test(s)) {
+    return "fr";
+  }
+  if (/\b(el|la|de|y|usted|nosotros|intento|puerta|c[oó]digo)\b/i.test(s)) {
+    return "es";
+  }
+  if (/\b(obrigad[oa]|voc(?:ê|es)|não|porta|ontem)\b/i.test(s)) {
+    return "pt";
+  }
   return "und";
+}
+/** 許容コードと表示名（必要に応じて拡張） */
+const ALLOWED_LANGS = new Set([
+  'ja','en','fr','de','es','pt','it','ro','pl','sq',
+  'zh','zh-Hant','ko','ru','uk','tr','nl','sv','no','da','fi',
+  'ar','fa','ur','he','hi','bn','th','vi','id','my','lo'
+]);
+
+/** 変種を正規化 */
+function normalizeLangCode(raw: string): string {
+  const c = (raw || '').toLowerCase();
+  if (c.startsWith('zh-hant') || c === 'zh-tw') return 'zh-Hant';
+  if (c.startsWith('zh') || c === 'zh-hans' || c === 'zh-cn') return 'zh';
+  if (c.startsWith('es')) return 'es';
+  if (c.startsWith('pt')) return 'pt';
+  return c;
+}
+
+/** ロマンス語（fr/es/pt）の重み付き簡易判定 */
+type Guess = { code: string; scores: Record<string, number> };
+function guessRomanceWeighted(s: string): Guess {
+  const t = (s || '').toLowerCase();
+  const frR = /(avec|nous|vous|bonjour|bonsoir|merci|soir[ée]e|où|quelle|heure|toujours|ville)/g;
+  const esR = /(gracias|usted(?:es)?|nosotros|intento|puerta|c[oó]digo|anoche|alrededor)/g;
+  const ptR = /(obrigad[oa]|voc(?:ê|es)|n[aã]o|porta|c[oó]digo|ontem|volta)/g;
+
+  let fr = (t.match(frR)?.length ?? 0);
+  let es = (t.match(esR)?.length ?? 0);
+  let pt = (t.match(ptR)?.length ?? 0);
+
+  if (/[çàâêîôûéèùëïüœ]/.test(t) && !/ñ/.test(t)) fr += 1;
+  if (/ñ/.test(t)) es += 1;
+  if (/[ãõê]/.test(t)) pt += 1;
+
+  const scores = { fr, es, pt };
+  const top = Object.entries(scores).sort((a,b)=>b[1]-a[1])[0];
+  const second = Object.entries(scores).sort((a,b)=>b[1]-a[1])[1]?.[1] ?? 0;
+
+  if (top && top[1] >= 2 && top[1] >= second + 1) return { code: top[0], scores };
+  return { code: 'und', scores };
+}
+
+/** 高精度検出器：ヒューリスティクス→ロマンス加点→LLM確定 */
+async function detectLangReliable(text: string): Promise<{ code: string }> {
+  // 0) 文字数が極端に短い/漢字だけは und
+  if (!text || isShortKanjiOnly(text)) return { code: 'und' };
+
+  // 1) 既存のざっくり推定
+  let code: string = guessLangFromText(text);
+
+  // 2) ロマンス語の曖昧さを追加チェック
+  const romance = guessRomanceWeighted(text);
+  const romanceSignal = romance.scores.fr + romance.scores.es + romance.scores.pt > 0;
+
+  // 3) 曖昧 or und or 非対応コードなら LLM で確定
+  if (code === 'und' || romanceSignal || !ALLOWED_LANGS.has(code)) {
+    const det = (await detectLanguageViaModel(text)) as DetectResult;
+    const raw =
+      typeof det === 'string' ? det :
+      Array.isArray(det) ? (det[0]?.code ?? det[0]?.lang ?? det[0]?.language ?? 'en') :
+      (det.code ?? det.lang ?? det.language ?? 'en');
+
+    code = normalizeLangCode(raw);
+  }
+
+  // 4) 最終正規化＆未知コードは en にフォールバック（UIを壊さないため）
+  if (!ALLOWED_LANGS.has(code)) code = 'en';
+  return { code };
 }
 
 

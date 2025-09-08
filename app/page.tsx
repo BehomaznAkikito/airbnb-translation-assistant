@@ -24,6 +24,7 @@ const LANG_OPTIONS: { code: string; label: string }[] = [
   { code: "uk", label: "ウクライナ語" },
   { code: "tr", label: "トルコ語" },
   { code: "it", label: "イタリア語" },
+  { code: 'fr', label: "フランス語" },
   { code: "ro", label: "ルーマニア語" },
   { code: "ta", label: "タミル語" },
   { code: "te", label: "テルグ語" },
