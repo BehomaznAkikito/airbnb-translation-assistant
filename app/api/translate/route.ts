@@ -50,8 +50,11 @@ export async function POST(req: Request): Promise<Response> {
 
     const action = body.action;
 
-    // 入力本文のざっくり言語推定（失敗時は 'und'）
-    const sourceLang = guessLangFromText(body.text);
+    // 入力本文のざっくり言語推定。曖昧ならモデルにフォールバック
+    let sourceLang: string = guessLangFromText(body.text);
+    if (sourceLang === "und") {
+      sourceLang = await detectLanguageViaModel(body.text);
+    }
 
     // ① ゲスト原文 → 日本語
     if (action === "to_ja") {
@@ -217,10 +220,18 @@ function guessLangFromText(s: string):
   if (/\b(yang|dan|tidak|saya|anda)\b/i.test(s)) return "id";
 
   // 西欧（ざっくり）
-  if (/\b(el|la|de|y|¿|¡)\b/i.test(s)) return "es";
+  const esCount =
+    (s.match(/[¿¡ñ]/g)?.length ?? 0) +
+    (s.match(/\b(el|la|los|las|que|para|con|por)\b/gi)?.length ?? 0);
+  const ptCount =
+    (s.match(/[ãõç]/gi)?.length ?? 0) +
+    (s.match(/\b(não|está|que|para|com|você)\b/gi)?.length ?? 0);
+
+  if (esCount >= 2 && esCount > ptCount) return "es";
+  if (ptCount >= 2 && ptCount > esCount) return "pt";
+
   if (/\b(le|la|de|des|est|avec)\b/i.test(s)) return "fr";
   if (/\b(der|die|das|und|nicht|ist)\b/i.test(s)) return "de";
-  if (/\b(o|a|de|que|não|está)\b/i.test(s)) return "pt";
 
   // 英語は「全文がASCIIのときのみ」（Wi-Fi混入で英語落ちするのを回避）
   if (!/[^\x00-\x7F]/.test(s) && /[A-Za-z]/.test(s)) return "en";
