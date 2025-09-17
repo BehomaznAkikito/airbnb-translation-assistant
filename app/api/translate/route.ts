@@ -287,6 +287,22 @@ function guessLangFromText(s: string):
   }
   return "und";
 }
+
+const ENGLISH_MARKERS = /\b(the|and|you|your|we|i|to|for|is|are|with|will|can|please|thank|thanks|hello|hi|check|stay|arrival|departure|room|house|booking|reservation|guest|apartment|host|contact|message|tomorrow|today|morning|evening)\b/gi;
+
+function looksLikeMostlyEnglish(text: string): boolean {
+  const input = text ?? "";
+  if (!input.trim()) return false;
+
+  const asciiLetters = (input.match(/[A-Za-z]/g) ?? []).length;
+  if (asciiLetters < 12) return false; // 極端に短い文はスキップ
+
+  const disallowed = input.match(/[^\sA-Za-z0-9.,!?"'`’“”–—():;\/\-]/g)?.length ?? 0;
+  if (disallowed > Math.max(2, Math.floor(asciiLetters * 0.1))) return false;
+
+  const markerHits = input.match(ENGLISH_MARKERS)?.length ?? 0;
+  return markerHits >= 2;
+}
 /** 許容コードと表示名（必要に応じて拡張） */
 const ALLOWED_LANGS = new Set([
   'ja','en','fr','de','es','pt','it','ro','pl','sq',
@@ -336,6 +352,11 @@ async function detectLangReliable(text: string): Promise<{ code: string }> {
   // 0) 文字数が極端に短い/漢字だけは und
   if (!text || isShortKanjiOnly(text)) return { code: 'und' };
 
+  // 0.5) 英語っぽさの優先判定（Smart Quotes 等の混入で und になるケースを救済）
+  if (looksLikeMostlyEnglish(text)) {
+    return { code: 'en' };
+  }
+
   // 1) 既存のざっくり推定
   let code: string = guessLangFromText(text);
 
@@ -356,6 +377,7 @@ async function detectLangReliable(text: string): Promise<{ code: string }> {
 
   // 4) 最終正規化＆未知コードは en にフォールバック（UIを壊さないため）
   if (!ALLOWED_LANGS.has(code)) code = 'en';
+  if (code !== 'en' && looksLikeMostlyEnglish(text)) code = 'en';
   return { code };
 }
 
