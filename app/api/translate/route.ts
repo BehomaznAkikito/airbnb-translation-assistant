@@ -36,30 +36,77 @@ interface ErrResponse {
   error: string;
 }
 
+
 export async function POST(req: Request): Promise<Response> {
   try {
-    const body = (await req.json()) as TranslateRequest;
+    // 受信ボディ（型はまだ確定しない）
+    const bodyUnknown = (await req.json()) as unknown;
 
-    // 入力チェック
-    if (!body?.text || !body?.action) {
+    // 互換シム用の入力型（any禁止）
+    type Incoming = Partial<TranslateRequest> & {
+      mode?: string;    // 例: "to_ja"
+      target?: string;  // 例: "ja"
+      message?: string; // text の別名
+      content?: string; // text の別名
+    };
+    const raw = bodyUnknown as Incoming;
+
+    // --- 互換シム：action / text を正規化 -------------------------
+    // action: { action:"to_ja" } が正だが、{ mode:"to_ja" } / { target:"ja" } も受ける
+    let actionNorm: TranslateRequest["action"] | undefined =
+      raw.action as TranslateRequest["action"] | undefined;
+
+    if (!actionNorm) {
+      if (typeof raw.mode === "string") {
+        actionNorm = raw.mode as TranslateRequest["action"];
+      } else if (
+        typeof raw.target === "string" &&
+        raw.target.toLowerCase().startsWith("ja")
+      ) {
+        actionNorm = "to_ja";
+      }
+    }
+
+    // text: {text} が正だが、{message}/{content} も許容
+    const textNorm =
+      typeof raw.text === "string" && raw.text.length > 0
+        ? raw.text
+        : typeof raw.message === "string" && raw.message.length > 0
+        ? raw.message
+        : typeof raw.content === "string" && raw.content.length > 0
+        ? raw.content
+        : "";
+
+    // 以降は payload をソースオブジェクトに統一
+    const payload: TranslateRequest = {
+      ...(raw as TranslateRequest),
+      action: actionNorm as TranslateRequest["action"],
+      text: textNorm,
+    };
+    // -------------------------------------------------------------
+
+    // 必須チェック
+    if (!payload?.text || !payload?.action) {
       return Response.json(
         { ok: false, error: "Missing required fields: 'text' and 'action'." } as ErrResponse,
         { status: 400 }
       );
     }
 
-    const action = body.action;
+    const action = payload.action;
 
-    // 入力本文のざっくり言語推定。曖昧ならモデルにフォールバック
-    let sourceLang: string = guessLangFromText(body.text);
-    if (sourceLang === "und") {
-      sourceLang = await detectLanguageViaModel(body.text);
-    }
+// 入力本文のざっくり言語推定
+let sourceLang: string = (await detectLangReliable(payload.text)).code;
+
+// detectLangReliable が und（不明）ならモデルでフォールバック
+if (sourceLang === "und") {
+  sourceLang = await detectLanguageViaModel(payload.text);
+}
 
     // ① ゲスト原文 → 日本語
     if (action === "to_ja") {
       const translated = await translate({
-        text: body.text,
+        text: payload.text,
         targetLang: "ja",
         tone: "neutral",
       });
@@ -75,7 +122,7 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     // ② あなたの返答（日本語） → ゲストの言語
-    const guestRaw = (body.guestSource ?? "").trim();
+    const guestRaw = (payload.guestSource ?? "").trim();
     if (!guestRaw) {
       return Response.json(
         { ok: false, error: "Missing 'guestSource' for action 'to_guest'." } as ErrResponse,
@@ -87,47 +134,35 @@ export async function POST(req: Request): Promise<Response> {
     let targetLang: string | undefined;
 
     // 1) 手動選択を最優先
-    if (body.guestLang && body.guestLang !== "auto") {
-      targetLang = body.guestLang;
+    if (payload.guestLang && payload.guestLang !== "auto") {
+      targetLang = payload.guestLang;
     }
 
     // 2) 次点で overrideLang
-    if (!targetLang && body.overrideLang && body.overrideLang !== "auto") {
-      targetLang = body.overrideLang;
+    if (!targetLang && payload.overrideLang && payload.overrideLang !== "auto") {
+      targetLang = payload.overrideLang;
     }
 
     // 3) まだ未決定なら自動判定（まず規則、und ならモデル）
-    if (!targetLang) {
-  let detected: string = guessLangFromText(guestRaw);
-  if (detected === "und") {
-    const det = (await detectLanguageViaModel(guestRaw)) as DetectResult;
-
-    const code: string =
-      typeof det === "string"
-        ? det
-        : Array.isArray(det)
-          ? (det[0]?.code ?? det[0]?.lang ?? det[0]?.language ?? "en")
-          : (det.code ?? det.lang ?? det.language ?? "en");
-
-    detected = code;
-  }
-  targetLang = detected; // 例: "en"
+    // 3) まだ未決定なら自動判定（高精度版）
+if (!targetLang) {
+  const { code } = await detectLangReliable(guestRaw);
+  targetLang = code; // 例: "fr" / "pl" / "sq"
 }
 
-
-    const tone: Tone = body.tone ?? "neutral";
+    const tone: Tone = payload.tone ?? "neutral";
 
     const translated = await translate({
-      text: body.text,          // 日本語の返信
-      targetLang: targetLang!,  // 最終決定した言語
+      text: payload.text,         // 日本語の返信
+      targetLang: targetLang!,    // 最終決定した言語
       tone,
     });
 
     return Response.json(
       {
         ok: true,
-        sourceLang,              // デバッグ用ざっくり推定
-        targetLang: targetLang!, // 実際に使ったターゲット
+        sourceLang,               // デバッグ用ざっくり推定
+        targetLang: targetLang!,  // 実際に使ったターゲット
         translation: translated,
       } as OkResponse
     );
@@ -179,13 +214,28 @@ function guessLangFromText(s: string):
   if (/[\u0E00-\u0E7F]/u.test(s)) return "th";
 
   // インド系ブロック
-  if (/[\u0900-\u097F]/u.test(s)) return "hi"; // デーヴァナーガリー（例: ヒンディー）
-  if (/[\u0B80-\u0BFF]/u.test(s)) return "ta"; // タミル
-  if (/[\u0C00-\u0C7F]/u.test(s)) return "te"; // テルグ
-  if (/[\u0980-\u09FF]/u.test(s)) return "bn"; // ベンガル
-  if (/[\u0C80-\u0CFF]/u.test(s)) return "kn"; // カンナダ
-  if (/[\u0D00-\u0D7F]/u.test(s)) return "ml"; // マラヤーラム
-  if (/[\u0A00-\u0A7F]/u.test(s)) return "pa"; // グルムキー（パンジャーブ語）
+
+  // デーヴァナーガリー（例: ヒンディー）
+  if (/[\u0900-\u097F]/u.test(s)) return "hi";
+
+  // タミル語 (Tamil) U+0B80–0BFF
+  if (/[\u0B80-\u0BFF]/u.test(s)) return "ta";
+
+  // テルグ語 (Telugu) U+0C00–0C7F
+  if (/[\u0C00-\u0C7F]/u.test(s)) return "te";
+
+  // ベンガル語 (Bengali) U+0980–09FF
+  if (/[\u0980-\u09FF]/u.test(s)) return "bn";
+
+  // カンナダ語 (Kannada) U+0C80–0CFF
+  if (/[\u0C80-\u0CFF]/u.test(s)) return "kn";
+
+  // マラヤーラム語 (Malayalam) U+0D00–0D7F
+  if (/[\u0D00-\u0D7F]/u.test(s)) return "ml";
+
+  // パンジャーブ語（グルムキー）(Punjabi/Gurmukhi) U+0A00–0A7F
+  if (/[\u0A00-\u0A7F]/u.test(s)) return "pa";
+
 
   // アラビア文字（base + supplement + ext-A）
   if (/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/u.test(s)) {
@@ -235,8 +285,113 @@ function guessLangFromText(s: string):
 
   // 英語は「全文がASCIIのときのみ」（Wi-Fi混入で英語落ちするのを回避）
   if (!/[^\x00-\x7F]/.test(s) && /[A-Za-z]/.test(s)) return "en";
+  // 英語は「全文がASCIIのときのみ」（Wi-Fi混入で英語落ちするのを回避）
+  if (!/[^\x00-\x7F]/.test(s) && /[A-Za-z]/.test(s)) return "en";
 
+  // 追加: フランス語/スペイン語/ポルトガル語の簡易判定
+  if (/\b(le|la|de|des|est|avec|nous|vous|merci|soir[ée]e|ville)\b/i.test(s)) {
+    return "fr";
+  }
+  if (/\b(el|la|de|y|usted|nosotros|intento|puerta|c[oó]digo)\b/i.test(s)) {
+    return "es";
+  }
+  if (/\b(obrigad[oa]|voc(?:ê|es)|não|porta|ontem)\b/i.test(s)) {
+    return "pt";
+  }
   return "und";
+}
+
+const ENGLISH_MARKERS = /\b(the|and|you|your|we|i|to|for|is|are|with|will|can|please|thank|thanks|hello|hi|check|stay|arrival|departure|room|house|booking|reservation|guest|apartment|host|contact|message|tomorrow|today|morning|evening)\b/gi;
+
+function looksLikeMostlyEnglish(text: string): boolean {
+  const input = text ?? "";
+  if (!input.trim()) return false;
+
+  const asciiLetters = (input.match(/[A-Za-z]/g) ?? []).length;
+  if (asciiLetters < 12) return false; // 極端に短い文はスキップ
+
+  const disallowed = input.match(/[^\sA-Za-z0-9.,!?"'`’“”–—():;\/\-]/g)?.length ?? 0;
+  if (disallowed > Math.max(2, Math.floor(asciiLetters * 0.1))) return false;
+
+  const markerHits = input.match(ENGLISH_MARKERS)?.length ?? 0;
+  return markerHits >= 2;
+}
+/** 許容コードと表示名（必要に応じて拡張） */
+const ALLOWED_LANGS = new Set([
+  'ja','en','fr','de','es','pt','it','ro','pl','sq',
+  'zh','zh-Hant','ko','ru','uk','tr','nl','sv','no','da','fi',
+  'ar','fa','ur','he',
+  // 南アジア系（ここを追加）
+  'hi','bn','ta','te','kn','ml','pa',
+  'th','vi','id','my','lo'
+]);
+
+/** 変種を正規化 */
+function normalizeLangCode(raw: string): string {
+  const c = (raw || '').toLowerCase();
+  if (c.startsWith('zh-hant') || c === 'zh-tw') return 'zh-Hant';
+  if (c.startsWith('zh') || c === 'zh-hans' || c === 'zh-cn') return 'zh';
+  if (c.startsWith('es')) return 'es';
+  if (c.startsWith('pt')) return 'pt';
+  return c;
+}
+
+/** ロマンス語（fr/es/pt）の重み付き簡易判定 */
+type Guess = { code: string; scores: Record<string, number> };
+function guessRomanceWeighted(s: string): Guess {
+  const t = (s || '').toLowerCase();
+  const frR = /(avec|nous|vous|bonjour|bonsoir|merci|soir[ée]e|où|quelle|heure|toujours|ville)/g;
+  const esR = /(gracias|usted(?:es)?|nosotros|intento|puerta|c[oó]digo|anoche|alrededor)/g;
+  const ptR = /(obrigad[oa]|voc(?:ê|es)|n[aã]o|porta|c[oó]digo|ontem|volta)/g;
+
+  let fr = (t.match(frR)?.length ?? 0);
+  let es = (t.match(esR)?.length ?? 0);
+  let pt = (t.match(ptR)?.length ?? 0);
+
+  if (/[çàâêîôûéèùëïüœ]/.test(t) && !/ñ/.test(t)) fr += 1;
+  if (/ñ/.test(t)) es += 1;
+  if (/[ãõê]/.test(t)) pt += 1;
+
+  const scores = { fr, es, pt };
+  const top = Object.entries(scores).sort((a,b)=>b[1]-a[1])[0];
+  const second = Object.entries(scores).sort((a,b)=>b[1]-a[1])[1]?.[1] ?? 0;
+
+  if (top && top[1] >= 2 && top[1] >= second + 1) return { code: top[0], scores };
+  return { code: 'und', scores };
+}
+
+/** 高精度検出器：ヒューリスティクス→ロマンス加点→LLM確定 */
+async function detectLangReliable(text: string): Promise<{ code: string }> {
+  // 0) 文字数が極端に短い/漢字だけは und
+  if (!text || isShortKanjiOnly(text)) return { code: 'und' };
+
+  // 0.5) 英語っぽさの優先判定（Smart Quotes 等の混入で und になるケースを救済）
+  if (looksLikeMostlyEnglish(text)) {
+    return { code: 'en' };
+  }
+
+  // 1) 既存のざっくり推定
+  let code: string = guessLangFromText(text);
+
+  // 2) ロマンス語の曖昧さを追加チェック
+  const romance = guessRomanceWeighted(text);
+  const romanceSignal = romance.scores.fr + romance.scores.es + romance.scores.pt > 0;
+
+  // 3) 曖昧 or und or 非対応コードなら LLM で確定
+  if (code === 'und' || romanceSignal || !ALLOWED_LANGS.has(code)) {
+    const det = (await detectLanguageViaModel(text)) as DetectResult;
+    const raw =
+      typeof det === 'string' ? det :
+      Array.isArray(det) ? (det[0]?.code ?? det[0]?.lang ?? det[0]?.language ?? 'en') :
+      (det.code ?? det.lang ?? det.language ?? 'en');
+
+    code = normalizeLangCode(raw);
+  }
+
+  // 4) 最終正規化＆未知コードは en にフォールバック（UIを壊さないため）
+  if (!ALLOWED_LANGS.has(code)) code = 'en';
+  if (code !== 'en' && looksLikeMostlyEnglish(text)) code = 'en';
+  return { code };
 }
 
 
