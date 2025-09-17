@@ -24,6 +24,17 @@ interface TranslateRequest {
   overrideLang?: string;    // ★追加: ヒント用("auto"可)
 }
 
+type IncomingPayload = Partial<TranslateRequest> & {
+  mode?: string;
+  target?: string;
+  message?: string;
+  content?: string;
+};
+
+function isAction(value: string): value is Action {
+  return value === "to_ja" || value === "to_guest";
+}
+
 interface OkResponse {
   ok: true;
   sourceLang: string;   // 入力本文の推定言語
@@ -39,20 +50,40 @@ interface ErrResponse {
 
 export async function POST(req: Request): Promise<Response> {
   try {
-    const body = (await req.json()) as TranslateRequest;
+    const body = (await req.json()) as IncomingPayload | null;
 
-    // 入力チェック
-    if (!body?.text || !body?.action) {
+    // ① 互換シム（ここを新規追加）
+    // - フロントが {mode:"to_ja"} を送ってきても受ける
+    // - text の別名（message/content）も吸収
+    const raw: IncomingPayload = { ...(body ?? {}) };
+    if (!raw.action) {
+      if (typeof raw.mode === "string" && isAction(raw.mode)) {
+        raw.action = raw.mode;           // "to_ja" → action
+      } else if (
+        typeof raw.target === "string" &&
+        raw.target.toLowerCase().startsWith("ja")
+      ) {
+        raw.action = "to_ja";            // target が ja 系なら to_ja と解釈
+      }
+    }
+    if (!raw.text) {
+      raw.text = raw.message ?? raw.content ?? "";
+    }
+    // 以降この payload を使う
+    const payload = raw as TranslateRequest;
+
+    // ② 必須チェック（payload に対して行う）
+    if (!payload?.text || !payload?.action) {
       return Response.json(
         { ok: false, error: "Missing required fields: 'text' and 'action'." } as ErrResponse,
         { status: 400 }
       );
     }
 
-    const action = body.action;
+    const action = payload.action;
 
     // 入力本文のざっくり言語推定（失敗時は 'und'）
-    const sourceLang = guessLangFromText(body.text);
+    const sourceLang = guessLangFromText(payload.text);
 
     // ① ゲスト原文 → 日本語
     if (action === "to_ja") {
@@ -96,24 +127,21 @@ export async function POST(req: Request): Promise<Response> {
 
     // 3) まだ未決定なら自動判定（まず規則、und ならモデル）
     if (!targetLang) {
-  let detected: string = guessLangFromText(guestRaw);
-  if (detected === "und") {
-    const det = (await detectLanguageViaModel(guestRaw)) as DetectResult;
+      let detected: string = guessLangFromText(guestRaw);
+      if (detected === "und") {
+        const det = (await detectLanguageViaModel(guestRaw)) as DetectResult;
+        const code: string =
+          typeof det === "string"
+            ? det
+            : Array.isArray(det)
+              ? (det[0]?.code ?? det[0]?.lang ?? det[0]?.language ?? "en")
+              : (det.code ?? det.lang ?? det.language ?? "en");
+        detected = code;
+      }
+      targetLang = detected; // 例: "en"
+    }
 
-    const code: string =
-      typeof det === "string"
-        ? det
-        : Array.isArray(det)
-          ? (det[0]?.code ?? det[0]?.lang ?? det[0]?.language ?? "en")
-          : (det.code ?? det.lang ?? det.language ?? "en");
-
-    detected = code;
-  }
-  targetLang = detected; // 例: "en"
-}
-
-
-    const tone: Tone = body.tone ?? "neutral";
+    const tone: Tone = payload.tone ?? "neutral";
 
     const translated = await translate({
       text: payload.text,         // 日本語の返信
