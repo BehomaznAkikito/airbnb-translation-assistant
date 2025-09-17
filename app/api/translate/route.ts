@@ -24,6 +24,17 @@ interface TranslateRequest {
   overrideLang?: string;    // ★追加: ヒント用("auto"可)
 }
 
+type IncomingPayload = Partial<TranslateRequest> & {
+  mode?: string;
+  target?: string;
+  message?: string;
+  content?: string;
+};
+
+function isAction(value: string): value is Action {
+  return value === "to_ja" || value === "to_guest";
+}
+
 interface OkResponse {
   ok: true;
   sourceLang: string;   // 入力本文の推定言語
@@ -38,14 +49,14 @@ interface ErrResponse {
 
 export async function POST(req: Request): Promise<Response> {
   try {
-    const body = (await req.json()) as TranslateRequest;
+    const body = (await req.json()) as IncomingPayload | null;
 
     // ① 互換シム（ここを新規追加）
     // - フロントが {mode:"to_ja"} を送ってきても受ける
     // - text の別名（message/content）も吸収
-    const raw: any = body ?? {};
+    const raw: IncomingPayload = { ...(body ?? {}) };
     if (!raw.action) {
-      if (typeof raw.mode === "string") {
+      if (typeof raw.mode === "string" && isAction(raw.mode)) {
         raw.action = raw.mode;           // "to_ja" → action
       } else if (
         typeof raw.target === "string" &&
