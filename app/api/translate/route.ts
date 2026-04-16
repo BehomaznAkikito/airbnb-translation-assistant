@@ -10,18 +10,14 @@ const MODEL = process.env.OPENAI_TRANSLATE_MODEL ?? "gpt-4o-mini-2024-07-18";
 
 type Tone = "neutral" | "formal" | "casual";
 type Action = "to_ja" | "to_guest";
-type DetectResult =
-  | string
-  | { code?: string; lang?: string; language?: string }
-  | Array<{ code?: string; lang?: string; language?: string }>;
 
 interface TranslateRequest {
-  action: Action;       // "to_ja" | "to_guest"
-  text: string;         // 翻訳したい本文
-  guestSource?: string; // ゲスト原文（to_guest のとき必須：ここからゲスト言語を推定）
-  tone?: Tone;          // to_guest のときのみ適用
-  guestLang?: string;       // ★追加: UIで選んだ言語コード("en"など/"auto"可)
-  overrideLang?: string;    // ★追加: ヒント用("auto"可)
+  action: Action;        // "to_ja" | "to_guest"
+  text: string;          // 翻訳したい本文
+  guestSource?: string;  // ゲスト原文（to_guest のとき必須：ここからゲスト言語を推定）
+  tone?: Tone;           // to_guest のときのみ適用
+  guestLang?: string;    // UI で選んだ言語コード("en"など/"auto"可)
+  overrideLang?: string; // ヒント用("auto"可)
 }
 
 interface OkResponse {
@@ -36,7 +32,6 @@ interface ErrResponse {
   error: string;
 }
 
-
 export async function POST(req: Request): Promise<Response> {
   try {
     const body = (await req.json()) as TranslateRequest;
@@ -50,14 +45,15 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     const action = body.action;
+    const text = (body?.text ?? "").trim();
 
-    // 入力本文のざっくり言語推定（失敗時は 'und'）
-    const sourceLang = guessLangFromText(body.text);
+    // 入力本文の言語推定（規則 → 不明なら LLM）
+    const sourceLang = await detectLanguage(text);
 
     // ① ゲスト原文 → 日本語
     if (action === "to_ja") {
       const translated = await translate({
-        text: payload.text,
+        text: body.text,
         targetLang: "ja",
         tone: "neutral",
       });
@@ -73,7 +69,7 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     // ② あなたの返答（日本語） → ゲストの言語
-    const guestRaw = (payload.guestSource ?? "").trim();
+    const guestRaw = (body.guestSource ?? "").trim();
     if (!guestRaw) {
       return Response.json(
         { ok: false, error: "Missing 'guestSource' for action 'to_guest'." } as ErrResponse,
@@ -81,51 +77,38 @@ export async function POST(req: Request): Promise<Response> {
       );
     }
 
-    // UI選択 > ヒント > 自動判定 の優先順位で targetLang を決定
+    // UI 選択 > ヒント > 自動判定 の優先順位で targetLang を決定
     let targetLang: string | undefined;
 
     // 1) 手動選択を最優先
-    if (payload.guestLang && payload.guestLang !== "auto") {
-      targetLang = payload.guestLang;
+    if (body.guestLang && body.guestLang !== "auto") {
+      targetLang = body.guestLang;
     }
 
     // 2) 次点で overrideLang
-    if (!targetLang && payload.overrideLang && payload.overrideLang !== "auto") {
-      targetLang = payload.overrideLang;
+    if (!targetLang && body.overrideLang && body.overrideLang !== "auto") {
+      targetLang = body.overrideLang;
     }
 
-    // 3) まだ未決定なら自動判定（まず規則、und ならモデル）
+    // 3) まだ未決定なら自動判定（規則 → LLM → 最終的に不明なら en）
     if (!targetLang) {
-  let detected: string = guessLangFromText(guestRaw);
-  if (detected === "und") {
-    const det = (await detectLanguageViaModel(guestRaw)) as DetectResult;
-
-    const code: string =
-      typeof det === "string"
-        ? det
-        : Array.isArray(det)
-          ? (det[0]?.code ?? det[0]?.lang ?? det[0]?.language ?? "en")
-          : (det.code ?? det.lang ?? det.language ?? "en");
-
-    detected = code;
-  }
-  targetLang = detected; // 例: "en"
-}
-
+      const detected = await detectLanguage(guestRaw);
+      targetLang = detected !== "und" ? detected : "en";
+    }
 
     const tone: Tone = body.tone ?? "neutral";
 
     const translated = await translate({
-      text: payload.text,         // 日本語の返信
-      targetLang: targetLang!,    // 最終決定した言語
+      text: body.text,   // 日本語の返信
+      targetLang,        // 最終決定した言語
       tone,
     });
 
     return Response.json(
       {
         ok: true,
-        sourceLang,               // デバッグ用ざっくり推定
-        targetLang: targetLang!,  // 実際に使ったターゲット
+        sourceLang,     // デバッグ用ざっくり推定
+        targetLang,     // 実際に使ったターゲット
         translation: translated,
       } as OkResponse
     );
@@ -137,7 +120,6 @@ export async function POST(req: Request): Promise<Response> {
   }
 }
 
-
 /* ===== 言語判定ユーティリティ ===== */
 
 // 短い「漢字だけ」→ 中国語への誤爆を避けるため 'und' 扱いにする
@@ -146,220 +128,164 @@ function isShortKanjiOnly(s: string): boolean {
   return SHORT_KANJI_RE.test(s.trim());
 }
 
-/** ざっくり文字種で判定（失敗時 'und'）。中国語は簡体/繁体を分ける */
-function guessLangFromText(s: string):
-  | "ja" | "ko" | "zh-Hant" | "zh-Hans" | "en"
-  | "es" | "fr" | "de" | "it" | "pt" | "ro" | "tr"
-  | "ru" | "uk"
-  | "hi" | "ta" | "te" | "bn" | "kn" | "ml" | "pa"
-  | "th" | "vi" | "id" | "my" | "lo"
-  | "he" | "ar" | "fa" | "ur" | "ps"
-  | "und" {
+/**
+ * 規則＋LLM による言語判定。
+ * - 判別確度の高いスクリプトは規則で即断（低レイテンシ）
+ * - ラテン系で曖昧な場合は LLM にフォールバック（ほぼ全世界の言語に対応）
+ * 返値は BCP-47 / ISO 639-1 コード。判定不能時は "und"。
+ */
+async function detectLanguage(text: string): Promise<string> {
+  const rule = guessLangFromText(text);
+  if (rule !== "und") return rule;
+  const viaModel = await detectLanguageViaModel(text);
+  return viaModel || "und";
+}
+
+/**
+ * 文字種・特徴語から言語を推定（失敗時 'und'）。
+ * - 非ラテン系は Unicode ブロックで決定的に判定
+ * - ラテン系はトルコ語/ポーランド語/ハンガリー語など「他言語と被らない独自文字」を持つ言語のみ即断
+ * - それ以外は単語マーカー、それでも不明なら 'und' を返し LLM に委譲
+ */
+function guessLangFromText(s: string): string {
   if (!s) return "und";
   if (isShortKanjiOnly(s)) return "und";
 
-  // ===== 非ラテン系 =====
-  // ヘブライ語 U+0590–05FF
-  if (/[\u0590-\u05FF]/u.test(s)) return "he";
-
-  // 日本語 / 韓国語
+  // ===== 非ラテン系スクリプト（Unicode ブロックで決定的）=====
+  // 日本語（ひらがな/カタカナがあれば確実に日本語）
   if (/[ぁ-ゖァ-ヺー]/u.test(s)) return "ja";
+  // 韓国語（ハングル音節）
   if (/[가-힣]/u.test(s)) return "ko";
-
   // 中国語（繁体/簡体の粗判）
   if (/[體國臺與優來麼說話發點這們嗎員門車長灣歡愛學習廣龍雞貓邊醫]/u.test(s)) return "zh-Hant";
   if (/[为这们吗级购广龙爱边医门]/u.test(s)) return "zh-Hans";
 
-  // ミャンマー（ビルマ） U+1000–109F + Ext-A/B
-  if (/[\u1000-\u109F\uA9E0-\uA9FF\uAA60-\uAA7F]/u.test(s)) return "my";
-  // ラオス U+0E80–0EFF
-  if (/[\u0E80-\u0EFF]/u.test(s)) return "lo";
-  // タイ U+0E00–0E7F
-  if (/[\u0E00-\u0E7F]/u.test(s)) return "th";
+  // ヘブライ語
+  if (/[\u0590-\u05FF]/u.test(s)) return "he";
+  // ギリシャ語
+  if (/[\u0370-\u03FF\u1F00-\u1FFF]/u.test(s)) return "el";
+  // アルメニア語
+  if (/[\u0530-\u058F]/u.test(s)) return "hy";
+  // ジョージア語
+  if (/[\u10A0-\u10FF\u2D00-\u2D2F]/u.test(s)) return "ka";
+  // エチオピア文字（アムハラ語・ティグリニャ語など）
+  if (/[\u1200-\u137F]/u.test(s)) return "am";
 
-  // インド系ブロック
+  // 東南アジア
+  if (/[\u1000-\u109F\uA9E0-\uA9FF\uAA60-\uAA7F]/u.test(s)) return "my"; // ミャンマー
+  if (/[\u0E80-\u0EFF]/u.test(s)) return "lo";                            // ラオス
+  if (/[\u1780-\u17FF]/u.test(s)) return "km";                            // クメール
+  if (/[\u0E00-\u0E7F]/u.test(s)) return "th";                            // タイ
 
-  // デーヴァナーガリー（例: ヒンディー）
-  if (/[\u0900-\u097F]/u.test(s)) return "hi";
+  // 南アジア
+  if (/[\u0D80-\u0DFF]/u.test(s)) return "si";               // シンハラ
+  if (/[\u0F00-\u0FFF]/u.test(s)) return "bo";               // チベット
+  if (/[\u1800-\u18AF]/u.test(s)) return "mn";               // モンゴル（伝統文字）
+  if (/[\u0900-\u097F]/u.test(s)) return "hi";               // デーヴァナーガリー
+  if (/[\u0980-\u09FF]/u.test(s)) return "bn";               // ベンガル
+  if (/[\u0A00-\u0A7F]/u.test(s)) return "pa";               // グルムキー
+  if (/[\u0A80-\u0AFF]/u.test(s)) return "gu";               // グジャラート
+  if (/[\u0B00-\u0B7F]/u.test(s)) return "or";               // オリヤー
+  if (/[\u0B80-\u0BFF]/u.test(s)) return "ta";               // タミル
+  if (/[\u0C00-\u0C7F]/u.test(s)) return "te";               // テルグ
+  if (/[\u0C80-\u0CFF]/u.test(s)) return "kn";               // カンナダ
+  if (/[\u0D00-\u0D7F]/u.test(s)) return "ml";               // マラヤーラム
 
-  // タミル語 (Tamil) U+0B80–0BFF
-  if (/[\u0B80-\u0BFF]/u.test(s)) return "ta";
-
-  // テルグ語 (Telugu) U+0C00–0C7F
-  if (/[\u0C00-\u0C7F]/u.test(s)) return "te";
-
-  // ベンガル語 (Bengali) U+0980–09FF
-  if (/[\u0980-\u09FF]/u.test(s)) return "bn";
-
-  // カンナダ語 (Kannada) U+0C80–0CFF
-  if (/[\u0C80-\u0CFF]/u.test(s)) return "kn";
-
-  // マラヤーラム語 (Malayalam) U+0D00–0D7F
-  if (/[\u0D00-\u0D7F]/u.test(s)) return "ml";
-
-  // パンジャーブ語（グルムキー）(Punjabi/Gurmukhi) U+0A00–0A7F
-  if (/[\u0A00-\u0A7F]/u.test(s)) return "pa";
-
-
-  // アラビア文字（base + supplement + ext-A）
+  // アラビア文字系
   if (/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/u.test(s)) {
-    // パシュトゥー固有
-    if (/[ځڅښږڼټډړګ]/u.test(s)) return "ps";
-    // ウルドゥー固有
-    if (/[ٹڈڑےٰںھہ]/u.test(s)) return "ur";
-    // ペルシア（Farsi）固有
-    if (/[پچژگ]/u.test(s)) return "fa";
-    // 既定はアラビア語
+    if (/[ځڅښږڼټډړګ]/u.test(s)) return "ps"; // パシュトゥー固有
+    if (/[ٹڈڑےٰںھہ]/u.test(s)) return "ur"; // ウルドゥー固有
+    if (/[پچژگ]/u.test(s)) return "fa";       // ペルシア固有
     return "ar";
   }
 
-  // キリル系 — ウクライナ→ロシア→その他
-  if (/[їєіґЇЄІҐ]/u.test(s)) return "uk";
-  if (/[ёэыЁЭЫ]/u.test(s)) return "ru";
-  if (/\p{Script=Cyrillic}/u.test(s)) return "ru";
+  // キリル文字系
+  if (/\p{Script=Cyrillic}/u.test(s)) {
+    if (/[їєіґЇЄІҐ]/u.test(s)) return "uk";
+    if (/[ўЎ]/u.test(s)) return "be";
+    if (/[ЉљЊњЏџЋћЂђ]/u.test(s)) return "sr"; // セルビア
+    if (/[ЅѕЌќЃѓ]/u.test(s)) return "mk";     // マケドニア
+    if (/\b(здравей|благодаря|моля|стая|резервация)\b/iu.test(s)) return "bg";
+    return "ru";
+  }
 
   // ===== ラテン系（独自文字や頻出語）=====
-  // トルコ語（独自文字）
-  if (/[ğĞşŞıİöÖüÜçÇ]/u.test(s)) return "tr";
-  // ルーマニア語（独自文字）
-  if (/[ăâîșşţțĂÂÎȘŞŢȚ]/u.test(s)) return "ro";
-  // イタリア語（機能語）
-  if (/\b(che|non|per|con|ciao|grazie|più|sono|sei|siete|degli|delle|dell|alla|alle|allo|agli|gli|una|uno|un|nel|nella|dai|dal|dalla)\b/i.test(s)) {
-    return "it";
+  // ▼ トルコ語: 真にトルコ語固有の ğ ş ı İ のみで判定。
+  //   ö / ü / ç は他言語と共有されるため判定材料に使わない（旧実装ではスウェーデン語が誤ってトルコ語にされていた）
+  if (/[ğĞşŞıİ]/u.test(s)) return "tr";
+  // ルーマニア語（ș ț ă â î）
+  if (/[ăĂâÂîÎșȘțȚşŞţŢ]/u.test(s)) return "ro";
+  // ポーランド語
+  if (/[ąĄęĘćĆłŁńŃśŚźŹżŻ]/u.test(s)) return "pl";
+  // チェコ/スロバキア語（発音符号が決定的）
+  if (/[čČďĎěĚňŇřŘšŠťŤůŮžŽ]/u.test(s)) {
+    if (/[ĺĽľĹŕŔ]/u.test(s)) return "sk"; // スロバキア固有
+    return "cs";
   }
-
-  // ベトナム語ダイアクリティクス
+  // ハンガリー語（ő ű が決定的）
+  if (/[őŐűŰ]/u.test(s)) return "hu";
+  // ベトナム語
   if (/[ăâêôơưđĂÂÊÔƠƯĐ]/u.test(s)) return "vi";
-  // インドネシア語の頻出語
-  if (/\b(yang|dan|tidak|saya|anda)\b/i.test(s)) return "id";
+  // アイスランド語（þ ð が決定的）
+  if (/[þÞðÐ]/u.test(s)) return "is";
 
-  // 西欧（ざっくり）
-  const esCount =
-    (s.match(/[¿¡ñ]/g)?.length ?? 0) +
-    (s.match(/\b(el|la|los|las|que|para|con|por)\b/gi)?.length ?? 0);
-  const ptCount =
-    (s.match(/[ãõç]/gi)?.length ?? 0) +
-    (s.match(/\b(não|está|que|para|com|você)\b/gi)?.length ?? 0);
+  // ===== 北欧系 =====
+  // ノルウェー/デンマーク/フェロー: æ ø
+  if (/[æøÆØ]/u.test(s)) {
+    if (/\b(og|ikke|jeg|det|er|har|på|den|som|være|tak|hej|hvordan|skal)\b/i.test(s)) return "da";
+    return "no";
+  }
+  // スウェーデン/フィンランド: å
+  if (/[åÅ]/u.test(s)) {
+    if (/\b(kiitos|hyvää|hei|terve|päivää|huone|asunto|varaus|olen|olet|minä|sinä)\b/i.test(s)) return "fi";
+    return "sv";
+  }
 
-  if (esCount >= 2 && esCount > ptCount) return "es";
-  if (ptCount >= 2 && ptCount > esCount) return "pt";
+  // 単語マーカーでの推定（å/æ/ø 無しのケース）
+  // フィンランド語
+  if (/\b(kiitos|hyvää|hei|terve|päivää|huone|asunto|varaus|kiitoksia|anteeksi|huomenta)\b/i.test(s)) return "fi";
+  // スウェーデン語
+  if (/\b(hej|tack|och|inte|jag|för|varsågod|rum|bokning|hälsningar|tusen|igen)\b/i.test(s)) return "sv";
+  // ノルウェー語
+  if (/\b(hei|takk|jeg|ikke|være|værelse|bestilling|morgen)\b/i.test(s)) return "no";
+  // デンマーク語
+  if (/\b(hej|tak|jeg|ikke|være|værelse|reservation|morgen|godt)\b/i.test(s)) return "da";
 
-  if (/\b(le|la|de|des|est|avec)\b/i.test(s)) return "fr";
-  if (/\b(der|die|das|und|nicht|ist)\b/i.test(s)) return "de";
+  // ===== 西欧 =====
+  // イタリア語
+  if (/\b(ciao|grazie|prego|per favore|più|sono|siete|degli|delle|alla|allo|nella|prenotazione|camera|arrivo|partenza|buongiorno|buonasera|stanza)\b/i.test(s)) return "it";
+  // スペイン語
+  if (/[¿¡]/.test(s) || /\b(hola|gracias|por favor|reserva|habitación|también|dónde|cómo|cuándo|porque|muchas|buenos días|buenas noches)\b/i.test(s)) return "es";
+  // フランス語
+  if (/\b(bonjour|bonsoir|merci|réservation|chambre|appartement|comment|aujourd['’]hui|très|votre|nous|vous)\b/i.test(s) || /\bs['’]il vous plaît\b/i.test(s)) return "fr";
+  // ドイツ語（ß はドイツ語/アルザス方言固有）
+  if (/ß/u.test(s) || /\b(guten|danke|bitte|zimmer|wohnung|buchung|ankunft|abreise|ihnen|ihre|haben|sind|nicht)\b/i.test(s)) return "de";
+  // ポルトガル語
+  if (/\b(olá|obrigado|obrigada|você|voce|quarto|reserva|não|está|bom dia|boa noite|quando|onde)\b/i.test(s)) return "pt";
+  // オランダ語
+  if (/\b(hallo|bedankt|dank u|alstublieft|kamer|reservering|welkom|goedemorgen|goedenavond|vriendelijke|groeten)\b/i.test(s)) return "nl";
+  // カタルーニャ語
+  if (/\b(hola|gràcies|si us plau|habitació|reserva|benvingut|bon dia)\b/i.test(s)) return "ca";
 
-  // 英語は「全文がASCIIのときのみ」（Wi-Fi混入で英語落ちするのを回避）
+  // ===== 東南アジア（ラテン表記）=====
+  // インドネシア
+  if (/\b(yang|dan|tidak|saya|anda|kamar|reservasi|terima kasih|selamat|pagi|malam)\b/i.test(s)) return "id";
+  // マレー
+  if (/\b(awak|bilik|tempahan|terima kasih|selamat|pagi|malam|selamat datang)\b/i.test(s)) return "ms";
+  // タガログ（フィリピノ）
+  if (/\b(salamat|kamusta|kumusta|ako|ikaw|kayo|naming|kwarto|reserba|magandang)\b/i.test(s)) return "tl";
+
+  // ===== その他 =====
+  // スワヒリ
+  if (/\b(jambo|asante|habari|chumba|karibu)\b/i.test(s)) return "sw";
+
+  // 英語は「全文が ASCII ＋ ラテン文字」のときのみ
   if (!/[^\x00-\x7F]/.test(s) && /[A-Za-z]/.test(s)) return "en";
-  // 英語は「全文がASCIIのときのみ」（Wi-Fi混入で英語落ちするのを回避）
-  if (!/[^\x00-\x7F]/.test(s) && /[A-Za-z]/.test(s)) return "en";
 
-  // 追加: フランス語/スペイン語/ポルトガル語の簡易判定
-  if (/\b(le|la|de|des|est|avec|nous|vous|merci|soir[ée]e|ville)\b/i.test(s)) {
-    return "fr";
-  }
-  if (/\b(el|la|de|y|usted|nosotros|intento|puerta|c[oó]digo)\b/i.test(s)) {
-    return "es";
-  }
-  if (/\b(obrigad[oa]|voc(?:ê|es)|não|porta|ontem)\b/i.test(s)) {
-    return "pt";
-  }
   return "und";
 }
 
-const ENGLISH_MARKERS = /\b(the|and|you|your|we|i|to|for|is|are|with|will|can|please|thank|thanks|hello|hi|check|stay|arrival|departure|room|house|booking|reservation|guest|apartment|host|contact|message|tomorrow|today|morning|evening)\b/gi;
-
-function looksLikeMostlyEnglish(text: string): boolean {
-  const input = text ?? "";
-  if (!input.trim()) return false;
-
-  const asciiLetters = (input.match(/[A-Za-z]/g) ?? []).length;
-  if (asciiLetters < 12) return false; // 極端に短い文はスキップ
-
-  const disallowed = input.match(/[^\sA-Za-z0-9.,!?"'`’“”–—():;\/\-]/g)?.length ?? 0;
-  if (disallowed > Math.max(2, Math.floor(asciiLetters * 0.1))) return false;
-
-  const markerHits = input.match(ENGLISH_MARKERS)?.length ?? 0;
-  return markerHits >= 2;
-}
-/** 許容コードと表示名（必要に応じて拡張） */
-const ALLOWED_LANGS = new Set([
-  'ja','en','fr','de','es','pt','it','ro','pl','sq',
-  'zh','zh-Hant','ko','ru','uk','tr','nl','sv','no','da','fi',
-  'ar','fa','ur','he',
-  // 南アジア系（ここを追加）
-  'hi','bn','ta','te','kn','ml','pa',
-  'th','vi','id','my','lo'
-]);
-
-/** 変種を正規化 */
-function normalizeLangCode(raw: string): string {
-  const c = (raw || '').toLowerCase();
-  if (c.startsWith('zh-hant') || c === 'zh-tw') return 'zh-Hant';
-  if (c.startsWith('zh') || c === 'zh-hans' || c === 'zh-cn') return 'zh';
-  if (c.startsWith('es')) return 'es';
-  if (c.startsWith('pt')) return 'pt';
-  return c;
-}
-
-/** ロマンス語（fr/es/pt）の重み付き簡易判定 */
-type Guess = { code: string; scores: Record<string, number> };
-function guessRomanceWeighted(s: string): Guess {
-  const t = (s || '').toLowerCase();
-  const frR = /(avec|nous|vous|bonjour|bonsoir|merci|soir[ée]e|où|quelle|heure|toujours|ville)/g;
-  const esR = /(gracias|usted(?:es)?|nosotros|intento|puerta|c[oó]digo|anoche|alrededor)/g;
-  const ptR = /(obrigad[oa]|voc(?:ê|es)|n[aã]o|porta|c[oó]digo|ontem|volta)/g;
-
-  let fr = (t.match(frR)?.length ?? 0);
-  let es = (t.match(esR)?.length ?? 0);
-  let pt = (t.match(ptR)?.length ?? 0);
-
-  if (/[çàâêîôûéèùëïüœ]/.test(t) && !/ñ/.test(t)) fr += 1;
-  if (/ñ/.test(t)) es += 1;
-  if (/[ãõê]/.test(t)) pt += 1;
-
-  const scores = { fr, es, pt };
-  const top = Object.entries(scores).sort((a,b)=>b[1]-a[1])[0];
-  const second = Object.entries(scores).sort((a,b)=>b[1]-a[1])[1]?.[1] ?? 0;
-
-  if (top && top[1] >= 2 && top[1] >= second + 1) return { code: top[0], scores };
-  return { code: 'und', scores };
-}
-
-/** 高精度検出器：ヒューリスティクス→ロマンス加点→LLM確定 */
-async function detectLangReliable(text: string): Promise<{ code: string }> {
-  // 0) 文字数が極端に短い/漢字だけは und
-  if (!text || isShortKanjiOnly(text)) return { code: 'und' };
-
-  // 0.5) 英語っぽさの優先判定（Smart Quotes 等の混入で und になるケースを救済）
-  if (looksLikeMostlyEnglish(text)) {
-    return { code: 'en' };
-  }
-
-  // 1) 既存のざっくり推定
-  let code: string = guessLangFromText(text);
-
-  // 2) ロマンス語の曖昧さを追加チェック
-  const romance = guessRomanceWeighted(text);
-  const romanceSignal = romance.scores.fr + romance.scores.es + romance.scores.pt > 0;
-
-  // 3) 曖昧 or und or 非対応コードなら LLM で確定
-  if (code === 'und' || romanceSignal || !ALLOWED_LANGS.has(code)) {
-    const det = (await detectLanguageViaModel(text)) as DetectResult;
-    const raw =
-      typeof det === 'string' ? det :
-      Array.isArray(det) ? (det[0]?.code ?? det[0]?.lang ?? det[0]?.language ?? 'en') :
-      (det.code ?? det.lang ?? det.language ?? 'en');
-
-    code = normalizeLangCode(raw);
-  }
-
-  // 4) 最終正規化＆未知コードは en にフォールバック（UIを壊さないため）
-  if (!ALLOWED_LANGS.has(code)) code = 'en';
-  if (code !== 'en' && looksLikeMostlyEnglish(text)) code = 'en';
-  return { code };
-}
-
-
-/** LLMで言語コードを推定（JSON返答を要求） */
+/** LLM で言語コードを推定（JSON 返答を要求）。失敗時は "und"。 */
 async function detectLanguageViaModel(text: string): Promise<string> {
   const completion = await client.chat.completions.create({
     model: MODEL,
@@ -367,10 +293,16 @@ async function detectLanguageViaModel(text: string): Promise<string> {
       {
         role: "system",
         content:
-          "You are a language detector. Reply ONLY with JSON like {\"lang\":\"<code>\"}. " +
-          "Use ISO 639-1 if possible. For Chinese, use 'zh-Hans' or 'zh-Hant'.",
+          "You are a language identification engine. Identify the primary natural language of the user's text. " +
+          "Reply ONLY with JSON: {\"lang\":\"<code>\"}. " +
+          "Use BCP-47 / ISO 639-1 codes. Examples of supported codes include but are not limited to: " +
+          "en, es, pt, pt-BR, fr, de, it, nl, ca, sv, no, da, fi, is, pl, cs, sk, hu, ro, bg, hr, sr, sl, el, " +
+          "ru, uk, be, lt, lv, et, tr, ar, he, fa, ur, ps, hi, bn, ta, te, kn, ml, pa, gu, mr, ne, si, " +
+          "th, vi, id, ms, tl, my, lo, km, sw, am, az, uz, kk, ky, hy, ka, mn, af, zu, sq, eu, gl, cy, ga, mt, eo. " +
+          "For Chinese, use 'zh-Hans' (Simplified) or 'zh-Hant' (Traditional). " +
+          "If truly undetectable, reply {\"lang\":\"und\"}.",
       },
-      { role: "user", content: `Detect the language code for:\n${text}` },
+      { role: "user", content: text },
     ],
   });
 
@@ -404,14 +336,15 @@ async function translate(args: { text: string; targetLang: string; tone: Tone })
         role: "system",
         content:
           "You are a precise translation engine for Airbnb hosts. " +
-          "Translate the user's message into the requested target language. " +
+          "Translate the user's message into the requested target language (given as a BCP-47 / ISO 639-1 code). " +
           "Preserve meaning, keep URLs/numbers/dates as-is, avoid adding information. " +
+          "If the target language code is unfamiliar, still translate as faithfully as possible into that language. " +
           "Reply ONLY with JSON: {\"translation\":\"...\"}.",
       },
       {
         role: "user",
         content:
-          `Target language: ${targetLang}\n` +
+          `Target language (BCP-47 code): ${targetLang}\n` +
           `${toneHint}\n` +
           "Keep sentences concise and natural for guest communication.\n" +
           "Text to translate:\n" +
@@ -427,7 +360,6 @@ async function translate(args: { text: string; targetLang: string; tone: Tone })
     const t = (parsed.translation ?? "").trim();
     if (t) return t;
   }
-  // 念のためのフォールバック
   return raw.trim();
 }
 

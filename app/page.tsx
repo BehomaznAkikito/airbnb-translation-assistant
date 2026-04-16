@@ -6,19 +6,115 @@ import type { ChangeEvent } from "react";
 
 type Tone = "neutral" | "formal" | "casual";
 
-const LOCALES = [
-  { code: "en-US-west", label: "English — US West Coast" },
-  { code: "en-US-east", label: "English — US East Coast" },
-  { code: "en-AU", label: "English — Australia" },
-  { code: "en-NZ", label: "English — New Zealand" },
-  { code: "de-DE", label: "Deutsch (DE)" },
-  { code: "de-CH", label: "Schweizer Hochdeutsch (CH)" },
-  { code: "fr-FR", label: "Français" },
-  { code: "it-IT", label: "Italiano" },
-  { code: "es-ES", label: "Español" },
-  { code: "zh-Hant", label: "繁體中文" },
-  { code: "zh-Hans", label: "简体中文" },
-  { code: "ko-KR", label: "한국어" },
+// 右→左言語（表示方向に使う）
+const RTL = new Set(["he", "ar", "fa", "ur", "ps", "yi", "dv", "sd"]);
+
+// 手動指定ドロップダウン（主要 60+ 言語。"auto" 時はサーバ側で自動判定 → LLM フォールバック）
+const LANG_OPTIONS: { code: string; label: string }[] = [
+  { code: "auto", label: "自動判定" },
+
+  // 東アジア
+  { code: "zh-Hans", label: "中国語（簡体）" },
+  { code: "zh-Hant", label: "中国語（繁体）" },
+  { code: "ko", label: "韓国語" },
+
+  // 東南アジア
+  { code: "th", label: "タイ語" },
+  { code: "vi", label: "ベトナム語" },
+  { code: "id", label: "インドネシア語" },
+  { code: "ms", label: "マレー語" },
+  { code: "tl", label: "タガログ語（フィリピノ）" },
+  { code: "my", label: "ミャンマー語" },
+  { code: "lo", label: "ラオス語" },
+  { code: "km", label: "クメール語" },
+
+  // 南アジア
+  { code: "hi", label: "ヒンディー語" },
+  { code: "ur", label: "ウルドゥー語" },
+  { code: "bn", label: "ベンガル語" },
+  { code: "ta", label: "タミル語" },
+  { code: "te", label: "テルグ語" },
+  { code: "kn", label: "カンナダ語" },
+  { code: "ml", label: "マラヤーラム語" },
+  { code: "pa", label: "パンジャーブ語" },
+  { code: "gu", label: "グジャラート語" },
+  { code: "mr", label: "マラーティー語" },
+  { code: "ne", label: "ネパール語" },
+  { code: "si", label: "シンハラ語" },
+
+  // 英語圏
+  { code: "en", label: "英語" },
+
+  // 西欧
+  { code: "es", label: "スペイン語" },
+  { code: "pt", label: "ポルトガル語" },
+  { code: "pt-BR", label: "ポルトガル語（ブラジル）" },
+  { code: "fr", label: "フランス語" },
+  { code: "de", label: "ドイツ語" },
+  { code: "it", label: "イタリア語" },
+  { code: "nl", label: "オランダ語" },
+  { code: "ca", label: "カタルーニャ語" },
+  { code: "gl", label: "ガリシア語" },
+  { code: "eu", label: "バスク語" },
+
+  // 北欧
+  { code: "sv", label: "スウェーデン語" },
+  { code: "no", label: "ノルウェー語" },
+  { code: "da", label: "デンマーク語" },
+  { code: "fi", label: "フィンランド語" },
+  { code: "is", label: "アイスランド語" },
+
+  // 中欧・東欧
+  { code: "pl", label: "ポーランド語" },
+  { code: "cs", label: "チェコ語" },
+  { code: "sk", label: "スロバキア語" },
+  { code: "hu", label: "ハンガリー語" },
+  { code: "ro", label: "ルーマニア語" },
+  { code: "bg", label: "ブルガリア語" },
+  { code: "hr", label: "クロアチア語" },
+  { code: "sr", label: "セルビア語" },
+  { code: "sl", label: "スロベニア語" },
+  { code: "mk", label: "マケドニア語" },
+  { code: "sq", label: "アルバニア語" },
+  { code: "el", label: "ギリシャ語" },
+
+  // スラブ系
+  { code: "ru", label: "ロシア語" },
+  { code: "uk", label: "ウクライナ語" },
+  { code: "be", label: "ベラルーシ語" },
+
+  // バルト
+  { code: "lt", label: "リトアニア語" },
+  { code: "lv", label: "ラトビア語" },
+  { code: "et", label: "エストニア語" },
+
+  // 中東・中央アジア
+  { code: "tr", label: "トルコ語" },
+  { code: "ar", label: "アラビア語" },
+  { code: "he", label: "ヘブライ語" },
+  { code: "fa", label: "ペルシア語" },
+  { code: "ps", label: "パシュトゥー語" },
+  { code: "az", label: "アゼルバイジャン語" },
+  { code: "uz", label: "ウズベク語" },
+  { code: "kk", label: "カザフ語" },
+  { code: "ky", label: "キルギス語" },
+  { code: "hy", label: "アルメニア語" },
+  { code: "ka", label: "ジョージア語" },
+  { code: "mn", label: "モンゴル語" },
+
+  // アフリカ
+  { code: "sw", label: "スワヒリ語" },
+  { code: "am", label: "アムハラ語" },
+  { code: "af", label: "アフリカーンス語" },
+  { code: "zu", label: "ズールー語" },
+
+  // ケルト系
+  { code: "cy", label: "ウェールズ語" },
+  { code: "ga", label: "アイルランド語" },
+
+  // その他
+  { code: "mt", label: "マルタ語" },
+  { code: "eo", label: "エスペラント" },
 ];
 
 // API レスポンス型
